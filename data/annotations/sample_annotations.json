@@ -1,0 +1,55 @@
+{
+  "info": {
+    "description": "Store Item Detection Dataset",
+    "version": "1.0",
+    "year": 2024,
+    "date_created": "2024-11-18"
+  },
+  "images": [
+    {
+      "id": 1,
+      "file_name": "sample_image_001.jpg",
+      "width": 640,
+      "height": 480,
+      "date_captured": "2024-11-18"
+    }
+  ],
+  "annotations": [
+    {
+      "id": 1,
+      "image_id": 1,
+      "category_id": 1,
+      "bbox": [100, 150, 200, 180],
+      "area": 36000,
+      "segmentation": [],
+      "iscrowd": 0
+    }
+  ],
+  "categories": [
+    {
+      "id": 1,
+      "name": "beverage",
+      "supercategory": "store_item"
+    },
+    {
+      "id": 2,
+      "name": "snack",
+      "supercategory": "store_item"
+    },
+    {
+      "id": 3,
+      "name": "dairy",
+      "supercategory": "store_item"
+    },
+    {
+      "id": 4,
+      "name": "bread",
+      "supercategory": "store_item"
+    },
+    {
+      "id": 5,
+      "name": "canned_goods",
+      "supercategory": "store_item"
+    }
+  ]
+}

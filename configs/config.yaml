@@ -1,0 +1,47 @@
+# Store Item Detection Configuration
+
+model:
+  name: yolov8
+  input_size: 640
+  num_classes: 10
+  pretrained: true
+  backbone: resnet50
+
+training:
+  batch_size: 16
+  epochs: 100
+  learning_rate: 0.001
+  optimizer: adam
+  weight_decay: 0.0005
+  early_stopping_patience: 10
+  gradient_clip_val: 10.0
+
+data:
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  image_size: [640, 640]
+  augmentation: true
+  num_workers: 4
+
+paths:
+  data_dir: data
+  train_images: data/raw/train
+  val_images: data/raw/val
+  test_images: data/raw/test
+  annotations: data/annotations
+  model_dir: models
+  checkpoint_dir: models/checkpoints
+  pretrained_dir: models/pretrained
+  output_dir: outputs
+  log_dir: logs
+
+inference:
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  max_detections: 100
+
+logging:
+  log_interval: 10
+  save_interval: 5
+  tensorboard: true
