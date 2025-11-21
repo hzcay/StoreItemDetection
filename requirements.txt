@@ -1,35 +1,16 @@
-# Core image processing
-opencv-python
-scikit-image
-imageio
-pillow
-matplotlib
-
-# Numerical computing
 numpy
-scipy
-
-# Machine Learning / Deep Learning
+pandas
+scikit-learn
 torch
 torchvision
-tensorflow
-keras
-
-# Utilities for augmentation & preprocessing
-albumentations
-imgaug
-
-# Visualization & plotting
-seaborn
-plotly
-
-# Advanced / optional tools
 tqdm
-notebook
-jupyterlab
-
-# For handling datasets and paths
-pandas
-glob2
+Pillow
+opencv-python
+qdrant-client
+fastapi
+uvicorn[standard]
+python-multipart
+matplotlib
+seaborn
 
 -e .
