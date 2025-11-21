@@ -1,0 +1,7 @@
+web : 7 
+
+video : 215 
+
+140 Shelf_16
+61 Shelf_21
+14 Shelf_22

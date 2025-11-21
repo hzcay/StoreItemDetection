@@ -1,0 +1,6 @@
+web : 5 
+
+video : 66 
+
+42 Shelf_2
+24 Shelf_4

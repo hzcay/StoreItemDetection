@@ -1,0 +1,35 @@
+# Core image processing
+opencv-python
+scikit-image
+imageio
+pillow
+matplotlib
+
+# Numerical computing
+numpy
+scipy
+
+# Machine Learning / Deep Learning
+torch
+torchvision
+tensorflow
+keras
+
+# Utilities for augmentation & preprocessing
+albumentations
+imgaug
+
+# Visualization & plotting
+seaborn
+plotly
+
+# Advanced / optional tools
+tqdm
+notebook
+jupyterlab
+
+# For handling datasets and paths
+pandas
+glob2
+
+-e .
