@@ -93,7 +93,7 @@ StoreItemDetection/
 ### 1. Clone repository
 
 ```bash
-git clone https://github.com/yourusername/StoreItemDetection.git
+git clone https://github.com/hzcay/StoreItemDetection.git
 cd StoreItemDetection
 ```
 
@@ -109,16 +109,10 @@ python -m venv venv
 source venv/bin/activate
 ```
 
-### 3. Cài đặt dependencies
+### 3. Cài đặt package
 
 ```bash
-pip install -r requirements.txt
-```
-
-### 4. Cài đặt package
-
-```bash
-pip install -e .
+pip install .
 ```
 
 **Happy Coding! 🚀**
