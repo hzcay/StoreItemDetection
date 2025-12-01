@@ -20,15 +20,6 @@ router = APIRouter(
     }
 )
 
-# ------------------------------------------------------
-# Initialize Qdrant client ONCE for this controller
-# ------------------------------------------------------
-
-
-
-# ------------------------------------------------------
-# Create Product with Images
-# ------------------------------------------------------
 @router.post(
     "/",
     response_model=ProductResponse,

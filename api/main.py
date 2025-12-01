@@ -6,6 +6,8 @@ from fastapi.responses import JSONResponse
 import uvicorn
 from typing import Dict, List
 from sqlalchemy.orm import Session
+from sqlalchemy import text
+from datetime import datetime
 
 # Import database and models
 from database import engine, get_db
@@ -13,6 +15,7 @@ from models import Base
 
 # Import routers
 from controllers.product_controller import router as product_router
+from controllers.categories_controller import router as categories_router
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -64,6 +67,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(product_router, tags=["Products"])
+app.include_router(categories_router, tags=["Categories"])
 
 # Health check endpoint
 @app.get(
@@ -109,7 +113,7 @@ async def health_check():
 async def test_db_connection(db: Session = Depends(get_db)):
     try:
         # Try to execute a simple query
-        db.execute("SELECT 1")
+        db.execute(text("SELECT 1"))
         return {
             "status": "success",
             "message": "Database connection successful",
