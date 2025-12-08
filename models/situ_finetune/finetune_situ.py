@@ -16,13 +16,11 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 from collections import Counter
-
+import torch.nn.functional as F
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
-
-
 class SituDataset(Dataset):
     def __init__(self, data_dir: str, transform=None):
         self.data_dir = Path(data_dir)
@@ -248,6 +246,17 @@ def unfreeze_all_layers(model: nn.Module):
     print("✅ Unfrozen: All layers (full fine-tuning)")
 
 
+@torch.no_grad()
+def compute_arcface_accuracy(embeddings, labels, arcface_head):
+    """
+    Precision@1 trên cosine thuần (không margin) để phản ánh retrieval.
+    """
+    cosine = F.linear(F.normalize(embeddings), F.normalize(arcface_head.weight))
+    _, predicted = cosine.max(1)
+    correct = predicted.eq(labels).sum().item()
+    return correct
+
+
 def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: str, strict: bool = False):
     """
     
@@ -260,13 +269,14 @@ def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: s
     model_state_dict = model.state_dict()
     
     if not strict:
-        if 'fc_arcface.weight' in state_dict:
-            pretrained_num_classes = state_dict['fc_arcface.weight'].shape[0]
-            current_num_classes = model_state_dict['fc_arcface.weight'].shape[0]
+        # Handle ArcFace head weight shape mismatch
+        if 'arcface_head.weight' in state_dict:
+            pretrained_num_classes = state_dict['arcface_head.weight'].shape[0]
+            current_num_classes = model_state_dict['arcface_head.weight'].shape[0]
             if pretrained_num_classes != current_num_classes:
                 print(f"   ⚠️  num_classes mismatch: {pretrained_num_classes} vs {current_num_classes}")
-                print(f"   ⚠️  Skipping fc_arcface, will initialize randomly")
-                state_dict.pop('fc_arcface.weight', None)
+                print(f"   ⚠️  Skipping arcface_head, will initialize randomly")
+                state_dict.pop('arcface_head.weight', None)
     
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     
@@ -298,7 +308,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         optimizer.zero_grad()
         
         embeddings = model(images)
-        logits = model.fc_arcface(embeddings)
+        logits = model.arcface_head(embeddings, labels)
         
         loss = criterion(logits, labels)
         loss.backward()
@@ -308,9 +318,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         optimizer.step()
         
         running_loss += loss.item()
-        _, predicted = logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -335,14 +344,13 @@ def validate(model, val_loader, criterion, device):
         labels = labels.to(device)
         
         embeddings = model(images)
-        logits = model.fc_arcface(embeddings)
+        logits = model.arcface_head(embeddings, labels)
         
         loss = criterion(logits, labels)
         
         running_loss += loss.item()
-        _, predicted = logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -583,7 +591,7 @@ def main():
                   list(model.res_block_3.parameters()) + list(model.res_block_4.parameters()) + \
                   list(model.res_block_5.parameters()) + list(model.res_block_6.parameters())
     head_params = list(model.fc_1.parameters()) + list(model.batch_norm_1.parameters()) + \
-                  list(model.fc_arcface.parameters())
+                  list(model.arcface_head.parameters())
     
     optimizer = optim.AdamW([
         {'params': stem_params, 'lr': args.lr * 0.1},

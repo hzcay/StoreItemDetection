@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 from functools import partial
 from typing import Any, Callable, Optional
+import math
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,41 @@ from torch import nn, Tensor
 
 from .utils.misc import Conv2dNormActivation, SqueezeExcitation as SElayer
 from .utils.utils import _make_divisible
+
+
+class ArcMarginProduct(nn.Module):
+    """
+    ArcFace head: L2-norm weight + margin m + scale s.
+    """
+
+    def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.5):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.cos_m = math.cos(m)
+        self.sin_m = math.sin(m)
+        self.th = math.cos(math.pi - m)
+        self.mm = math.sin(math.pi - m) * m
+
+    def forward(self, embedding: Tensor, label: Tensor) -> Tensor:
+        # embedding is already L2-normalized; normalize weight as well
+        cosine = F.linear(F.normalize(embedding), F.normalize(self.weight))
+        sine = torch.sqrt(torch.clamp(1.0 - cosine ** 2, min=0.0))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, label.view(-1, 1), 1.0)
+
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+        return output
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
@@ -308,8 +344,10 @@ class ResMobileNetV2(nn.Module):
         self.fc_1 = nn.Linear(input_channels, embedding_size)
         self.batch_norm_1 = nn.BatchNorm1d(embedding_size)
         self.relu_1 = nn.ReLU(inplace=True)
-        
-        self.fc_arcface = nn.Linear(embedding_size, num_classes, bias=False)
+
+        self.arcface_head = ArcMarginProduct(
+            in_features=embedding_size, out_features=num_classes, s=30.0, m=0.35
+        )
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):

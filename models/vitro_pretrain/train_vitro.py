@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -173,6 +174,17 @@ def freeze_layers(model: nn.Module, freeze_stem: bool = True, freeze_mobile: boo
     print("✅ Training: ResNet tail + Embedding head")
 
 
+@torch.no_grad()
+def compute_arcface_accuracy(embeddings, labels, arcface_head):
+    """
+    Precision@1 trên cosine thuần (không margin) để phản ánh retrieval.
+    """
+    cosine = F.linear(F.normalize(embeddings), F.normalize(arcface_head.weight))
+    _, predicted = cosine.max(1)
+    correct = predicted.eq(labels).sum().item()
+    return correct
+
+
 def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
     """Train 1 epoch"""
     model.train()
@@ -189,7 +201,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         
         # Forward: lấy embedding và logits từ ArcFace
         embeddings = model(images)
-        logits = model.fc_arcface(embeddings)
+        logits = model.arcface_head(embeddings, labels)
         
         loss = criterion(logits, labels)
         loss.backward()
@@ -197,9 +209,8 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         
         # Stats
         running_loss += loss.item()
-        _, predicted = logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -225,14 +236,13 @@ def validate(model, val_loader, criterion, device):
         labels = labels.to(device)
         
         embeddings = model(images)
-        logits = model.fc_arcface(embeddings)
+        logits = model.arcface_head(embeddings, labels)
         
         loss = criterion(logits, labels)
         
         running_loss += loss.item()
-        _, predicted = logits.max(1)
         total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
+        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',

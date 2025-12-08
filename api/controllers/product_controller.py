@@ -5,8 +5,15 @@ from sqlalchemy.orm import Session
 import os
 import uuid
 
-# Updated import after renaming local folder
-from qdrant_utils.qdrant_client import create_qdrant_client, save_embedding_to_qdrant
+from qdrant_utils.qdrant_client import (
+    create_qdrant_client,  # kept for compatibility
+    initialize_model,      # kept for compatibility
+    save_embedding_to_qdrant,
+    search_similar,
+    search_with_rerank,
+    get_model,
+    get_qdrant_client,
+)
 from database import get_db
 from schemas.schema import ProductCreate, ProductResponse, ProductUpdate
 from services.product_service import ProductService
@@ -38,6 +45,13 @@ def create_product(
     images: List[UploadFile] = File(None),
     db: Session = Depends(get_db)
 ):
+    print("Creating product...")
+    print("Price: ", price)
+    print("Stock quantity: ", stock_quantity)
+    print("SKU: ", sku)
+    print("Barcode: ", barcode)
+    print("Is active: ", is_active)
+    print("Category ID: ", category_id)
     # ------------------------------
     # Validate price
     # ------------------------------
@@ -63,8 +77,17 @@ def create_product(
         is_active=is_active,
         category_id=category_id
     )
+    print("Product data created successfully")
     product = service.create_product(product_data)
-    qdrant_client = create_qdrant_client()
+    print("Product created successfully")
+    qdrant_client = get_qdrant_client()
+    model = get_model()
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model is not initialized")
+    if qdrant_client is None:
+        raise HTTPException(status_code=500, detail="Qdrant client is not initialized")
+    else:
+        print("Model and Qdrant client initialized successfully")
     # ------------------------------
     # Save images + generate embeddings
     # ------------------------------
@@ -93,9 +116,11 @@ def create_product(
 
                 # Save embedding to Qdrant
                 save_embedding_to_qdrant(
+                    model,
                     qdrant_client,
                     product_id=product.id,
-                    image_path=file_path
+                    image_path=file_path,
+                    point_id=str(uuid.uuid4())  # Qdrant expects unsigned int or UUID
                 )
 
             except Exception as e:
@@ -137,6 +162,127 @@ def list_products(
 ):
     service = ProductService(db)
     return service.list_products(skip=skip, limit=limit)
+
+
+# ------------------------------
+# Search similar products via Qdrant (cosine, top-K, no threshold)
+# ------------------------------
+@router.post(
+    "/search",
+    summary="Search similar products by image",
+    description="Upload an image, returns top-K similar products from Qdrant using cosine distance.",
+)
+async def search_products(
+    file: UploadFile = File(..., description="Query image file"),
+    top_k: int = Query(20, ge=1, le=100, description="Number of results to return"),
+):
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    ext = file.filename.split(".")[-1].lower()
+    filename = f"{uuid.uuid4()}.{ext}"
+    file_path = os.path.join(upload_dir, filename)
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    model = get_model()
+    client = get_qdrant_client()
+    if model is None or client is None:
+        raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
+
+    try:
+        hits = search_similar(model, client, file_path, top_k=top_k)
+        return {"results": hits}
+    finally:
+        # optional: keep file for audit? For now, remove temp
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+
+# ------------------------------
+# Search with ORB rerank + product info (ArcFace + Qdrant → ORB → CLIP tie-break)
+# ------------------------------
+@router.post(
+    "/search-rerank",
+    summary="Search products with ORB rerank",
+    description="Upload an image, returns reranked results using ArcFace + Qdrant → ORB → CLIP (tie-break) with product information.",
+)
+async def search_products_rerank(
+    file: UploadFile = File(..., description="Query image file"),
+    top_k: int = Query(20, ge=1, le=100, description="Number of initial candidates from Qdrant"),
+    orb_threshold: float = Query(0.3, ge=0.0, le=1.0, description="ORB threshold (0-1)"),
+    use_clip_tiebreak: bool = Query(False, description="Use CLIP for tie-break (chỉ dùng khi cần phân biệt rất gắt)"),
+    db: Session = Depends(get_db)
+):
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    ext = file.filename.split(".")[-1].lower()
+    filename = f"{uuid.uuid4()}.{ext}"
+    file_path = os.path.join(upload_dir, filename)
+    with open(file_path, "wb") as f:
+        f.write(await file.read())
+
+    model = get_model()
+    client = get_qdrant_client()
+    if model is None or client is None:
+        raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
+
+    try:
+        # Search với rerank ORB (+ CLIP nếu enabled)
+        reranked_hits = search_with_rerank(
+            model, 
+            client, 
+            file_path, 
+            top_k=top_k, 
+            orb_threshold=orb_threshold,
+            use_clip_tiebreak=use_clip_tiebreak
+        )
+        
+        # Lấy product info từ DB
+        service = ProductService(db)
+        results = []
+        seen_product_ids = set()
+        
+        for hit in reranked_hits:
+            product_id = hit.get('payload', {}).get('product_id')
+            if not product_id or product_id in seen_product_ids:
+                continue
+            
+            try:
+                product = service.get_product(product_id)
+                seen_product_ids.add(product_id)
+                
+                result_item = {
+                    "product_id": product_id,
+                    "product_name": product.name,
+                    "product_price": product.price,
+                    "product_description": product.description,
+                    "image_path": hit.get('payload', {}).get('image_path'),
+                    "cosine_score": hit.get('cosine_score', 0.0),
+                    "normalized_cosine": hit.get('normalized_cosine', 0.0),
+                    "orb_score": hit.get('orb_score', 0.0),
+                    "combined_score": hit.get('combined_score', 0.0),
+                    "clip_score": hit.get('clip_score')  # None nếu không dùng CLIP, float nếu có
+                }
+                
+                results.append(result_item)
+            except HTTPException:
+                # Product không tồn tại trong DB, skip
+                continue
+        
+        return {
+            "results": results,
+            "total_found": len(results),
+            "orb_threshold": orb_threshold,
+            "clip_tiebreak_used": use_clip_tiebreak
+        }
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
 
 # ------------------------------
 # Update Product
