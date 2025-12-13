@@ -5,13 +5,15 @@ from typing import Optional, Dict, Any, Union, List, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision import transforms, models
+from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 from PIL import Image
 import torch.nn as nn
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
-import cv2
+from qdrant_utils.color_rerank import compute_color_score
+from qdrant_utils.local_feature_rerank import compute_local_feature_score
 
 # -------------------------------
 # Qdrant configuration
@@ -27,6 +29,15 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Module-level singletons to avoid reloading per request
 _MODEL_CACHE: Optional[ResMobileNetV2] = None
 _QDRANT_CLIENT: Optional[QdrantClient] = None
+_DINO_MODEL_CACHE = None
+_DINO_TRANSFORM = transforms.Compose([
+    transforms.Resize(256, interpolation=InterpolationMode.BICUBIC),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+_CLIP_MODEL_CACHE = None
+_CLIP_PROCESSOR_CACHE = None
 
 transform = transforms.Compose([
     transforms.Resize(256),
@@ -36,17 +47,10 @@ transform = transforms.Compose([
 ])
 
 def initialize_model():
-    """
-    Legacy initializer (kept for compatibility). Prefer get_model().
-    """
     return get_model()
 
 
 def get_model():
-    """
-    Initialize and load the ResMobileNetV2 model from checkpoint.
-    The checkpoint is a dictionary containing model_state_dict, embedding_size, num_classes, etc.
-    """
     global _MODEL_CACHE
     if _MODEL_CACHE is not None:
         return _MODEL_CACHE
@@ -76,9 +80,6 @@ def get_model():
     return _MODEL_CACHE
 
 def create_qdrant_client() -> Optional[QdrantClient]:
-    """
-    Legacy initializer (kept for compatibility). Prefer get_qdrant_client().
-    """
     return get_qdrant_client()
 
 
@@ -128,7 +129,6 @@ def search_similar(
     if client is None:
         raise RuntimeError("Qdrant client not initialized")
 
-    # Check collection exists and has data
     try:
         collections = client.get_collections()
         collection_names = [c.name for c in collections.collections]
@@ -136,7 +136,6 @@ def search_similar(
             print(f"Warning: Collection '{QDRANT_COLLECTION}' does not exist")
             return []
         
-        # Check collection info
         collection_info = client.get_collection(QDRANT_COLLECTION)
         point_count = collection_info.points_count if hasattr(collection_info, 'points_count') else 0
         print(f"Collection '{QDRANT_COLLECTION}' has {point_count} points")
@@ -223,47 +222,41 @@ def search_similar(
     return results
 
 
-def calculate_orb_score(image_path1: str, image_path2: str, max_features: int = 500) -> float:
+def get_dino_model():
     """
-    Tính ORB feature matching score giữa 2 ảnh (0-1, càng gần 1 càng giống).
-    ORB tốt cho phân biệt logo, chữ, chi tiết pixel.
+    Lazy load DINOv2-Small for visual rerank.
     """
+    global _DINO_MODEL_CACHE
+    if _DINO_MODEL_CACHE is not None:
+        return _DINO_MODEL_CACHE
     try:
-        img1 = cv2.imread(image_path1, cv2.IMREAD_GRAYSCALE)
-        img2 = cv2.imread(image_path2, cv2.IMREAD_GRAYSCALE)
-        
-        if img1 is None or img2 is None:
-            return 0.0
-        
-        img1 = cv2.resize(img1, (640, 640))
-        img2 = cv2.resize(img2, (640, 640))
-        
-        orb = cv2.ORB_create(nfeatures=max_features)
-        
-        kp1, des1 = orb.detectAndCompute(img1, None)
-        kp2, des2 = orb.detectAndCompute(img2, None)
-        
-        if des1 is None or des2 is None:
-            return 0.0
-        
-        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-        matches = bf.match(des1, des2)
-        
-        if len(matches) == 0:
-            return 0.0
-    
-        avg_features = (len(kp1) + len(kp2)) / 2.0
-        orb_score = len(matches) / max(avg_features, 1.0)
-        
-        orb_score = min(orb_score, 1.0)
-        
-        return orb_score
+        dino_model = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+        dino_model.to(DEVICE)
+        dino_model.eval()
+        _DINO_MODEL_CACHE = dino_model
+        print("DINOv2 model loaded successfully")
+        return dino_model
     except Exception as e:
-        print(f"Error calculating ORB score: {e}")
-        return 0.0
+        print(f"Error loading DINOv2 model: {e}")
+        return None
 
-_CLIP_MODEL_CACHE = None
-_CLIP_PROCESSOR_CACHE = None
+
+def get_dino_embedding(image_path: str) -> Optional[np.ndarray]:
+    model = get_dino_model()
+    if model is None:
+        return None
+    try:
+        img = Image.open(image_path).convert("RGB")
+        img_tensor = _DINO_TRANSFORM(img).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            feat = model(img_tensor)
+            if isinstance(feat, (tuple, list)):
+                feat = feat[0]
+            feat = F.normalize(feat.squeeze(), p=2, dim=0)
+        return feat.detach().cpu().numpy().astype(np.float32)
+    except Exception as e:
+        print(f"Error computing DINO embedding for {image_path}: {e}")
+        return None
 
 
 def get_clip_model():
@@ -296,128 +289,111 @@ def get_clip_model():
         return None, None
 
 
-def calculate_clip_score(image_path1: str, image_path2: str) -> float:
-    """
-    Tính CLIP similarity score giữa 2 ảnh (0-1, càng gần 1 càng giống).
-    CLIP tốt cho tie-break khi cần phân biệt rất gắt (Coca Zero vs Light vs Nguyên bản).
-    """
+def get_clip_embedding(image_path: str) -> Optional[np.ndarray]:
     model, preprocess = get_clip_model()
     if model is None or preprocess is None:
-        print("Warning: CLIP model not available, returning 0.0")
-        return 0.0
-    
+        print("Warning: CLIP model not available")
+        return None
     try:
-        import torch
-        
         device = next(model.parameters()).device
-        
-        img1 = Image.open(image_path1).convert('RGB')
-        img2 = Image.open(image_path2).convert('RGB')
-        
-        img1_tensor = preprocess(img1).unsqueeze(0).to(device)
-        img2_tensor = preprocess(img2).unsqueeze(0).to(device)
-        
+        img = Image.open(image_path).convert("RGB")
+        img_tensor = preprocess(img).unsqueeze(0).to(device)
         with torch.no_grad():
-            img1_features = model.encode_image(img1_tensor)
-            img2_features = model.encode_image(img2_tensor)
-            
-            img1_features = F.normalize(img1_features, p=2, dim=1)
-            img2_features = F.normalize(img2_features, p=2, dim=1)
-            
-            clip_score_raw = (img1_features @ img2_features.T).item()
-        
-        clip_score = (clip_score_raw + 1) / 2.0
-        
-        print(f"CLIP: {image_path1} vs {image_path2} -> raw={clip_score_raw:.4f}, normalized={clip_score:.4f}")
-        return clip_score
+            features = model.encode_image(img_tensor)
+            features = F.normalize(features, p=2, dim=1)
+        return features.squeeze().detach().cpu().numpy().astype(np.float32)
     except Exception as e:
-        print(f"Error calculating CLIP score for {image_path1} vs {image_path2}: {e}")
+        print(f"Error computing CLIP embedding for {image_path}: {e}")
         import traceback
         traceback.print_exc()
-        return 0.0
+        return None
 
 
 def search_with_rerank(
     model: nn.Module,
     client: QdrantClient,
     query_image_path: str,
-    top_k: int = 20,
-    orb_threshold: float = 0.3,
-    cosine_weight: float = 0.4,
-    orb_weight: float = 0.6,
-    use_clip_tiebreak: bool = False,
-    clip_threshold: float = 0.85
+    top_k: int = 200,
+    local_weight: float = 0.45,  # BRAND
+    color_weight: float = 0.35,  # VARIANT
+    embed_weight: float = 0.20,  # SEMANTIC
+    fusion_threshold: float = 0.0,
 ) -> List[Dict[str, Any]]:
-    """
-    Search với rerank: ArcFace + Qdrant → ORB → CLIP (tie-break)
+
     
-    Pipeline:
-    1. ArcFace → query embedding
-    2. Qdrant Top-K (cosine similarity từ embedding)
-    3. Tính ORB score cho mỗi candidate (feature matching)
-    4. Rerank theo combined_score = cosine_weight * cosine + orb_weight * ORB
-    5. Filter theo ORB threshold
-    6. (Optional) CLIP tie-break cho các case khó phân biệt
-    
-    Args:
-        use_clip_tiebreak: Nếu True, dùng CLIP để tie-break các candidate có score gần nhau
-        clip_threshold: Ngưỡng để trigger CLIP tie-break (combined_score >= threshold)
-    """
     if client is None:
         raise RuntimeError("Qdrant client not initialized")
-    
-    query_embedding = get_image_embedding(query_image_path, model)
-    
+
     initial_results = search_similar(model, client, query_image_path, top_k=top_k)
-    
     if not initial_results:
+        print("No initial results found")
         return []
     
+    print(f"Found {len(initial_results)} initial candidates")
+    
     reranked_results = []
-    for hit in initial_results:
-        candidate_image_path = hit.get('payload', {}).get('image_path')
+    for idx, hit in enumerate(initial_results):
+        candidate_image_path = hit.get("payload", {}).get("image_path")
         if not candidate_image_path or not os.path.exists(candidate_image_path):
             continue
         
-        cosine_score = hit.get('score', 0.0)
+        embed_score_raw = hit.get("score", 0.0)
+        embed_score = max(0.0, min(1.0, float(embed_score_raw)))
         
+        local_result = {}
         try:
-            orb_score = calculate_orb_score(query_image_path, candidate_image_path)
-            
-            normalized_cosine = cosine_score if cosine_score >= 0 else (cosine_score + 1) / 2
-            
-            combined_score = cosine_weight * normalized_cosine + orb_weight * orb_score
-            
-            result_item = {
-                **hit,
-                "cosine_score": cosine_score,
-                "normalized_cosine": normalized_cosine,
-                "orb_score": orb_score,
-                "combined_score": combined_score
-            }
-            if use_clip_tiebreak:
-                clip_score = calculate_clip_score(query_image_path, candidate_image_path)
-                result_item["clip_score"] = clip_score
-                print(f"CLIP score for {candidate_image_path} (combined_score={combined_score:.4f}): {clip_score:.4f}")
-                result_item["combined_score"] = 0.3 * normalized_cosine + 0.3 * orb_score + 0.4 * clip_score
-            else:
-                result_item["clip_score"] = None
-            
-            reranked_results.append(result_item)
+            local_result = compute_local_feature_score(
+                query_image_path,
+                candidate_image_path
+            )
+            local_score = local_result.get("local_score", 0.0)
         except Exception as e:
-            print(f"Error calculating ORB for {candidate_image_path}: {e}")
-            continue
+            print(f"Error computing local feature score for candidate {idx}: {e}")
+            local_score = 0.0
+            local_result = {"error": str(e)}
+        
+        color_result = {}
+        try:
+            color_result = compute_color_score(
+                query_image_path,
+                candidate_image_path,
+                color_space="HSV",
+                k_colors=3
+            )
+            color_score = color_result.get("color_score", 0.5)
+        except Exception as e:
+            print(f"Error computing color score for candidate {idx}: {e}")
+            color_score = 0.5
+            color_result = {"error": str(e)}
+        
+        final_score = (
+            local_weight * local_score +      # BRAND (0.55)
+            color_weight * color_score +      # VARIANT (0.25)
+            embed_weight * embed_score        # SEMANTIC (0.20)
+        )
+        
+        result_item = {
+            **hit,
+            "embed_score": float(embed_score),
+            "local_score": float(local_score),
+            "color_score": float(color_score),
+            "final_score": float(final_score),
+            "local_details": local_result,
+            "color_details": color_result,
+        }
+        
+        reranked_results.append(result_item)
+        
+        if (idx + 1) % 50 == 0:
+            print(f"Processed {idx + 1}/{len(initial_results)} candidates...")
     
-    reranked_results.sort(key=lambda x: x['combined_score'], reverse=True)
+    reranked_results.sort(key=lambda x: x["final_score"], reverse=True)
     
-    filtered_results = [
-        r for r in reranked_results 
-        if r['orb_score'] >= orb_threshold
-    ]
+    if fusion_threshold is not None and fusion_threshold > 0:
+        reranked_results = [r for r in reranked_results if r["final_score"] >= fusion_threshold]
     
-    print(f"Reranked: {len(reranked_results)} candidates, {len(filtered_results)} passed ORB threshold {orb_threshold}")
     
-    return filtered_results
+    return reranked_results
 
 
 def save_embedding_to_qdrant(

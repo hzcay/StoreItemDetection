@@ -201,18 +201,19 @@ async def search_products(
 
 
 # ------------------------------
-# Search with ORB rerank + product info (ArcFace + Qdrant → ORB → CLIP tie-break)
+# Search with Enterprise Rerank Flow (Global → Local Features → Color → Fusion)
 # ------------------------------
 @router.post(
     "/search-rerank",
-    summary="Search products with ORB rerank",
-    description="Upload an image, returns reranked results using ArcFace + Qdrant → ORB → CLIP (tie-break) with product information.",
+    summary="Search products with Enterprise Rerank Flow"
 )
 async def search_products_rerank(
     file: UploadFile = File(..., description="Query image file"),
-    top_k: int = Query(20, ge=1, le=100, description="Number of initial candidates from Qdrant"),
-    orb_threshold: float = Query(0.3, ge=0.0, le=1.0, description="ORB threshold (0-1)"),
-    use_clip_tiebreak: bool = Query(False, description="Use CLIP for tie-break (chỉ dùng khi cần phân biệt rất gắt)"),
+    top_k: int = Query(200, ge=1, le=500, description="Top-K candidates from Global Retrieval (Qdrant)"),
+    local_weight: float = Query(0.55, ge=0.0, le=1.0, description="Weight for local feature score - BRAND (default: 0.55)"),
+    color_weight: float = Query(0.25, ge=0.0, le=1.0, description="Weight for color score - VARIANT (default: 0.25)"),
+    embed_weight: float = Query(0.20, ge=0.0, le=1.0, description="Weight for embedding score - SEMANTIC (default: 0.20)"),
+    fusion_threshold: float = Query(0.0, ge=0.0, le=1.0, description="Filter results below this final score"),
     db: Session = Depends(get_db)
 ):
     upload_dir = "uploads"
@@ -228,15 +229,24 @@ async def search_products_rerank(
     if model is None or client is None:
         raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
 
+    # Validate weights sum to ~1.0 (allow small tolerance)
+    weight_sum = local_weight + color_weight + embed_weight
+    if abs(weight_sum - 1.0) > 0.1:
+        # Normalize weights
+        local_weight = local_weight / weight_sum if weight_sum > 0 else 0.55
+        color_weight = color_weight / weight_sum if weight_sum > 0 else 0.25
+        embed_weight = embed_weight / weight_sum if weight_sum > 0 else 0.20
+
     try:
-        # Search với rerank ORB (+ CLIP nếu enabled)
         reranked_hits = search_with_rerank(
-            model, 
-            client, 
-            file_path, 
-            top_k=top_k, 
-            orb_threshold=orb_threshold,
-            use_clip_tiebreak=use_clip_tiebreak
+            model,
+            client,
+            file_path,
+            top_k=top_k,
+            local_weight=local_weight,
+            color_weight=color_weight,
+            embed_weight=embed_weight,
+            fusion_threshold=fusion_threshold,
         )
         
         # Lấy product info từ DB
@@ -258,12 +268,14 @@ async def search_products_rerank(
                     "product_name": product.name,
                     "product_price": product.price,
                     "product_description": product.description,
-                    "image_path": hit.get('payload', {}).get('image_path'),
-                    "cosine_score": hit.get('cosine_score', 0.0),
-                    "normalized_cosine": hit.get('normalized_cosine', 0.0),
-                    "orb_score": hit.get('orb_score', 0.0),
-                    "combined_score": hit.get('combined_score', 0.0),
-                    "clip_score": hit.get('clip_score')  # None nếu không dùng CLIP, float nếu có
+                    "image_path": hit.get("payload", {}).get("image_path"),
+                    "embed_score": hit.get("embed_score"),
+                    "local_score": hit.get("local_score"),
+                    "color_score": hit.get("color_score"),
+                    "final_score": hit.get("final_score"),
+                    # Optional: include detailed scores
+                    "local_details": hit.get("local_details", {}),
+                    "color_details": hit.get("color_details", {}),
                 }
                 
                 results.append(result_item)
@@ -274,8 +286,11 @@ async def search_products_rerank(
         return {
             "results": results,
             "total_found": len(results),
-            "orb_threshold": orb_threshold,
-            "clip_tiebreak_used": use_clip_tiebreak
+            "top_k": top_k,
+            "local_weight": local_weight,
+            "color_weight": color_weight,
+            "embed_weight": embed_weight,
+            "fusion_threshold": fusion_threshold
         }
     finally:
         try:

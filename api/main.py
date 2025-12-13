@@ -27,8 +27,8 @@ app = FastAPI(
     title="Store Item Detection API",
     description="API for managing store items, products, and categories",
     version="1.0.0",
-    docs_url=None,  # Disable default docs to customize
-    redoc_url=None,  # Disable default redoc to customize
+    docs_url=None,  
+    redoc_url=None,  
     openapi_url="/api/openapi.json"
 )
 
@@ -134,4 +134,4 @@ async def test_db_connection(db: Session = Depends(get_db)):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)     
