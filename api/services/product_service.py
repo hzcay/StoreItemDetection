@@ -7,11 +7,58 @@ import uuid
 from models import Product as ProductModel, ProductImage as ProductImageModel
 from schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductImageCreate, ProductImageResponse
 from repositories.product_repository import ProductRepository
-
+from ultralytics import YOLO
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 class ProductService:
     def __init__(self, db: Session):
         self.db = db
         self.product_repo = ProductRepository(db)
+
+    def handleSearchProductByImage(
+    self,
+    image: Optional[UploadFile]
+) -> List[ProductResponse]:
+
+        # Missing image
+        if image is None:
+            return []
+
+        # Load YOLO model
+        model = YOLO(r"D:\digital-image-processing\StoreItemDetection\api\models\best.pt")
+
+        # Read uploaded image bytes
+        image_bytes = image.file.read()
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            return []
+
+        # Run detection
+        results = model(img)
+        detections = results[0]
+
+        # Extract all crops
+        crops = []
+        for box in detections.boxes:
+            # get xyxy bounding box coordinates
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+            # crop the region from the original image
+            crop = img[y1:y2, x1:x2]
+
+            # skip invalid crops
+            if crop.size == 0:
+                continue
+
+            crops.append(crop)
+
+
+        # TODO: Convert crops to embeddings + search DB
+        return []
+
 
     def create_product(self, product_data: ProductCreate) -> ProductResponse:
         """

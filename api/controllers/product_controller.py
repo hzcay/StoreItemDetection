@@ -4,6 +4,7 @@ from typing import List
 from sqlalchemy.orm import Session
 import os
 import uuid
+from typing import Optional
 
 from qdrant_utils.qdrant_client import (
     create_qdrant_client,  # kept for compatibility
@@ -129,6 +130,19 @@ def create_product(
 
     return product
 
+
+
+
+@router.post(
+    "/search",
+    response_model=List[ProductResponse]
+)
+def search_product(
+    image: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db)
+):
+    service = ProductService(db)
+    return service.handleSearchProductByImage(image)
 # ------------------------------
 # Get Product by ID
 # ------------------------------
