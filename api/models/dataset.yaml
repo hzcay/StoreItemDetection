@@ -1,0 +1,5 @@
+train: /kaggle/input/sku110k-annotations/SKU110K_fixed/images/train
+val: /kaggle/input/sku110k-annotations/SKU110K_fixed/images/val
+
+names:
+  0: object
