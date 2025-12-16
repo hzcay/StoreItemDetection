@@ -26,7 +26,10 @@ class ProductService:
             return []
 
         # Load YOLO model
-        model = YOLO(r"D:\digital-image-processing\StoreItemDetection\api\models\best.pt")
+        base_dir = os.path.dirname(__file__)  # folder of product_service.py
+        model_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
+        model = YOLO(model_path)
+
 
         # Read uploaded image bytes
         image_bytes = image.file.read()
