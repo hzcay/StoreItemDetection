@@ -58,8 +58,6 @@ class ProductService:
 
             crops.append(crop)
 
-
-        # TODO: Convert crops to embeddings + search DB
         return []
 
 

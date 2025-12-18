@@ -59,7 +59,7 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-# CORS middleware configuration
+# CORS middleware configuration 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

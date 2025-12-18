@@ -31,5 +31,8 @@ alembic==1.12.1
 # Machine Learning
 scikit-learn>=1.0.0
 
+# Visualization
+matplotlib>=3.5.0
+
 # Project
 -e .

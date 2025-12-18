@@ -17,10 +17,13 @@ from PIL import Image
 from tqdm import tqdm
 from collections import Counter
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
+from models.losses.supcon_loss import SupConLoss
 class SituDataset(Dataset):
     def __init__(self, data_dir: str, transform=None):
         self.data_dir = Path(data_dir)
@@ -133,7 +136,7 @@ def get_class_weights(dataset, num_classes=None, device='cpu'):
 def create_data_loaders(
     data_dir: str,
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: int = 8,  # Tăng từ 4 lên 8-16 để tăng tốc data loading
     train_split: float = 0.7,
     val_split: float = 0.15,
     test_split: float = 0.15,
@@ -155,13 +158,10 @@ def create_data_loaders(
         transforms.Resize(256),
         transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomVerticalFlip(p=0.2),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-        transforms.RandomRotation(degrees=15),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+    
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        transforms.RandomErasing(p=0.1)
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+       
     ])
     
     transform_val = transforms.Compose([
@@ -216,25 +216,39 @@ def create_data_loaders(
             replacement=True
         )
         
+        # Trên Kaggle/Colab, persistent_workers có thể gây lỗi
+        # Tắt persistent_workers để tránh worker crash (trade-off: hơi chậm hơn một chút)
+        use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
+        
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, sampler=train_sampler,
-            num_workers=num_workers, pin_memory=True
+            num_workers=num_workers, pin_memory=True,
+            persistent_workers=use_persistent,
+            prefetch_factor=2 if num_workers > 0 else None  # None nếu num_workers=0
         )
         print("   ✅ Using weighted sampling for balanced training")
     else:
+        use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True
+            num_workers=num_workers, pin_memory=True,
+            persistent_workers=use_persistent,
+            prefetch_factor=2 if num_workers > 0 else None
         )
     
+    use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     return train_loader, val_loader, test_loader, len(set([s[1] for s in full_dataset.samples])), full_dataset
@@ -294,32 +308,72 @@ def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: s
     print(f"   ✅ Pretrained val acc: {checkpoint.get('val_acc', 0):.2f}%")
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=True):
+    """Train 1 epoch với mixed precision để tăng tốc"""
     model.train()
+    supcon_lambda = getattr(model, "supcon_lambda", 0.0)
+    supcon_criterion = getattr(model, "supcon_criterion", None)
     running_loss = 0.0
     correct = 0
     total = 0
     
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
+    # Handle device: support both string and torch.device
+    if isinstance(device, str):
+        is_cuda = device == 'cuda' and torch.cuda.is_available()
+    else:
+        is_cuda = device.type == 'cuda'
+    
+    # Mixed precision scaler (dùng API mới để tránh deprecation warning)
+    scaler = torch.amp.GradScaler('cuda') if use_amp and is_cuda else None
+    
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)  # leave=False để không spam terminal
     for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)  # non_blocking=True để tăng tốc transfer
+        labels = labels.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        embeddings = model(images)
-        logits = model.arcface_head(embeddings, labels)
-        
-        loss = criterion(logits, labels)
-        loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
+        # Mixed precision forward
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                embeddings = model(images)
+                logits = model.arcface_head(embeddings, labels)
+                loss_arc = criterion(logits, labels)
+
+                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                    final_emb = model.get_final_embedding(images)
+                    loss_sup = supcon_criterion(final_emb, labels)
+                else:
+                    loss_sup = loss_arc.new_tensor(0.0)
+
+                loss = loss_arc + (supcon_lambda * loss_sup)
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            embeddings = model(images)
+            logits = model.arcface_head(embeddings, labels)
+            loss_arc = criterion(logits, labels)
+
+            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                final_emb = model.get_final_embedding(images)
+                loss_sup = supcon_criterion(final_emb, labels)
+            else:
+                loss_sup = loss_arc.new_tensor(0.0)
+
+            loss = loss_arc + (supcon_lambda * loss_sup)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         
         running_loss += loss.item()
         total += labels.size(0)
-        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
+        # Tính accuracy mỗi batch (cần thiết cho tracking)
+        with torch.no_grad():
+            correct += compute_arcface_accuracy(embeddings.detach(), labels, model.arcface_head)
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -327,26 +381,56 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         })
     
     epoch_loss = running_loss / len(train_loader)
-    epoch_acc = 100. * correct / total
+    epoch_acc = 100. * correct / total if total > 0 else 0.0
     return epoch_loss, epoch_acc
 
 
 @torch.no_grad()
-def validate(model, val_loader, criterion, device):
+def validate(model, val_loader, criterion, device, use_amp=True):
+    """Validate model với mixed precision để tăng tốc"""
     model.eval()
+    supcon_lambda = getattr(model, "supcon_lambda", 0.0)
+    supcon_criterion = getattr(model, "supcon_criterion", None)
     running_loss = 0.0
     correct = 0
     total = 0
     
-    pbar = tqdm(val_loader, desc="[Val]")
+    # Handle device: support both string and torch.device
+    if isinstance(device, str):
+        is_cuda = device == 'cuda' and torch.cuda.is_available()
+    else:
+        is_cuda = device.type == 'cuda'
+    
+    pbar = tqdm(val_loader, desc="[Val]", leave=False)  # leave=False
     for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)  # non_blocking=True
+        labels = labels.to(device, non_blocking=True)
         
-        embeddings = model(images)
-        logits = model.arcface_head(embeddings, labels)
-        
-        loss = criterion(logits, labels)
+        if use_amp and is_cuda:
+            with torch.cuda.amp.autocast():
+                embeddings = model(images)
+                logits = model.arcface_head(embeddings, labels)
+                loss_arc = criterion(logits, labels)
+
+                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                    final_emb = model.get_final_embedding(images)
+                    loss_sup = supcon_criterion(final_emb, labels)
+                else:
+                    loss_sup = loss_arc.new_tensor(0.0)
+
+                loss = loss_arc + (supcon_lambda * loss_sup)
+        else:
+            embeddings = model(images)
+            logits = model.arcface_head(embeddings, labels)
+            loss_arc = criterion(logits, labels)
+
+            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                final_emb = model.get_final_embedding(images)
+                loss_sup = supcon_criterion(final_emb, labels)
+            else:
+                loss_sup = loss_arc.new_tensor(0.0)
+
+            loss = loss_arc + (supcon_lambda * loss_sup)
         
         running_loss += loss.item()
         total += labels.size(0)
@@ -478,6 +562,52 @@ def compute_mean_average_precision(test_emb, gallery_emb, test_labels, gallery_l
     return map_score
 
 
+def plot_training_curves(train_acc_history, val_acc_history, train_loss_history, val_loss_history, save_path=None):
+    """
+    Plot biểu đồ training curves: accuracy và loss
+    Nếu save_path=None thì chỉ hiển thị, không lưu file
+    """
+    epochs = range(1, len(train_acc_history) + 1)
+    
+    # Tạo figure với 2 subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Plot Accuracy
+    ax1.plot(epochs, train_acc_history, 'b-', label='Train Accuracy', linewidth=2, marker='o', markersize=4)
+    ax1.plot(epochs, val_acc_history, 'r-', label='Validation Accuracy', linewidth=2, marker='s', markersize=4)
+    
+    # Highlight best validation accuracy
+    if val_acc_history:
+        best_val_acc = max(val_acc_history)
+        best_epoch = val_acc_history.index(best_val_acc) + 1
+        ax1.axvline(x=best_epoch, color='green', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax1.plot(best_epoch, best_val_acc, 'go', markersize=10, label=f'Best Val Acc: {best_val_acc:.2f}%')
+    
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Accuracy (%)', fontsize=12)
+    ax1.set_title('Training and Validation Accuracy', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=11, loc='best')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim([1, len(epochs)])
+    
+    # Plot Loss
+    ax2.plot(epochs, train_loss_history, 'b-', label='Train Loss', linewidth=2, marker='o', markersize=4)
+    ax2.plot(epochs, val_loss_history, 'r-', label='Validation Loss', linewidth=2, marker='s', markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Loss', fontsize=12)
+    ax2.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=11, loc='best')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim([1, len(epochs)])
+    
+    plt.tight_layout()
+    
+    # Hiển thị biểu đồ thay vì lưu ảnh
+    print(f"   📈 Training curves plotted successfully")
+    print(f"   👁️  Đang hiển thị biểu đồ...")
+    plt.show()
+
+
 @torch.no_grad()
 def evaluate_test(model, test_loader, train_loader, criterion, device):
     """Evaluate on test set với các metrics: Precision@1, Recall@5, mAP"""
@@ -540,6 +670,16 @@ def main():
                         help='Learning rate (should be smaller than pretrain)')
     parser.add_argument('--embedding-size', type=int, default=512,
                         help='Embedding dimension (must match pretrained model)')
+    parser.add_argument('--use-color-embedding', action='store_true',
+                        help='Enable ColorEncoder and final embedding concat (visual ⊕ α·color)')
+    parser.add_argument('--color-embedding-size', type=int, default=64,
+                        help='Color embedding dimension (default: 64)')
+    parser.add_argument('--color-alpha', type=float, default=0.3,
+                        help='Scale for color embedding in final embedding (default: 0.3)')
+    parser.add_argument('--supcon-lambda', type=float, default=0.0,
+                        help='Weight for SupCon loss on final embedding (default: 0.0 = off)')
+    parser.add_argument('--supcon-temp', type=float, default=0.07,
+                        help='Temperature for SupCon loss (default: 0.07)')
     parser.add_argument('--resume', type=str, default=None,
                         help='Resume from checkpoint')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
@@ -548,6 +688,14 @@ def main():
                         help='Use weighted sampling to balance classes (khuyến nghị cho imbalanced data)')
     parser.add_argument('--use-class-weights', action='store_true',
                         help='Use class weights in loss function (khuyến nghị cho imbalanced data)')
+
+    # ArcFace margin warm-up (off by default)
+    parser.add_argument('--arcface-margin-start', type=float, default=None,
+                        help='ArcFace margin warmup start (e.g., 0.0). If set, enables warm-up.')
+    parser.add_argument('--arcface-margin-end', type=float, default=0.35,
+                        help='ArcFace margin warmup end (e.g., 0.35 or 0.5)')
+    parser.add_argument('--arcface-warmup-epochs', type=int, default=10,
+                        help='Number of epochs for linear margin warmup')
     
     args = parser.parse_args()
     
@@ -557,6 +705,7 @@ def main():
     train_loader, val_loader, test_loader, num_classes, full_dataset = create_data_loaders(
         args.data_dir, 
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         use_weighted_sampling=args.use_weighted_sampling
     )
     print(f"   Classes: {num_classes}")
@@ -569,20 +718,28 @@ def main():
     model = ResMobileNetV2(
         inverted_residual_setting=inverted_residual_setting,
         embedding_size=args.embedding_size,
-        num_classes=num_classes
+        num_classes=num_classes,
+        use_color_embedding=args.use_color_embedding,
+        color_embedding_size=args.color_embedding_size
     ).to(args.device)
+
+    model.color_alpha = args.color_alpha if hasattr(model, "color_alpha") else args.color_alpha
+    model.supcon_lambda = float(args.supcon_lambda)
+    model.supcon_criterion = SupConLoss(temperature=args.supcon_temp) if args.supcon_lambda > 0 else None
     
     load_pretrained_checkpoint(model, args.pretrained, args.device, strict=False)
     
     unfreeze_all_layers(model)
     
+    # Label smoothing để giảm overfitting (giảm confidence quá cao)
     if args.use_class_weights:
         class_weights = get_class_weights(full_dataset, num_classes=num_classes, device=args.device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
-        print(f"\n   ✅ Using class weights in loss function")
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+        print(f"\n   ✅ Using class weights + label smoothing in loss function")
         print(f"   Weight range: {class_weights.min():.2f} - {class_weights.max():.2f}")
     else:
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        print(f"\n   ✅ Using label smoothing (0.1) to reduce overfitting")
     
     stem_params = list(model.conv1.parameters()) + list(model.bn1.parameters()) + \
                   list(model.transition.parameters())
@@ -598,7 +755,7 @@ def main():
         {'params': mobile_params, 'lr': args.lr * 0.1},
         {'params': tail_params, 'lr': args.lr},
         {'params': head_params, 'lr': args.lr * 2.0},
-    ], weight_decay=1e-4)
+    ], weight_decay=5e-4)  # Tăng weight decay để giảm overfitting
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
@@ -609,6 +766,12 @@ def main():
     
     start_epoch = 0
     best_val_acc = 0.0
+    
+    # Lưu history để plot biểu đồ
+    train_acc_history = []
+    val_acc_history = []
+    train_loss_history = []
+    val_loss_history = []
     
     if args.resume:
         print(f"\n📂 Loading checkpoint: {args.resume}")
@@ -626,6 +789,16 @@ def main():
     print(f"   Batch size: {args.batch_size}\n")
     
     for epoch in range(start_epoch, args.epochs):
+        # ArcFace margin warm-up
+        if args.arcface_margin_start is not None and hasattr(model, "arcface_head"):
+            warm = max(int(args.arcface_warmup_epochs), 1)
+            t = min(max(epoch / warm, 0.0), 1.0)
+            m = float(args.arcface_margin_start + t * (args.arcface_margin_end - args.arcface_margin_start))
+            if hasattr(model.arcface_head, "set_margin"):
+                model.arcface_head.set_margin(m)
+            else:
+                model.arcface_head.m = m
+
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, args.device, epoch)
         
         val_loss, val_acc = validate(model, val_loader, criterion, args.device)
@@ -636,6 +809,12 @@ def main():
         print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         print(f"  LR: {scheduler.get_last_lr()[0]:.6f}\n")
+        
+        # Lưu vào history
+        train_acc_history.append(train_acc)
+        val_acc_history.append(val_acc)
+        train_loss_history.append(train_loss)
+        val_loss_history.append(val_loss)
         
         checkpoint = {
             'epoch': epoch,
@@ -678,6 +857,14 @@ def main():
     best_checkpoint['test_recall_at_5'] = test_results['recall_at_5']
     best_checkpoint['test_mean_average_precision'] = test_results['mean_average_precision']
     torch.save(best_checkpoint, os.path.join(args.output_dir, 'best.pth'))
+    
+    # Plot biểu đồ training history
+    print(f"\n📊 Plotting training curves...")
+    plot_training_curves(
+        train_acc_history, val_acc_history,
+        train_loss_history, val_loss_history,
+        save_path=None  # Không lưu ảnh, chỉ hiển thị
+    )
     
     print(f"\n🎉 Fine-tuning completed!")
     print(f"   Best Val Acc: {best_val_acc:.2f}%")
