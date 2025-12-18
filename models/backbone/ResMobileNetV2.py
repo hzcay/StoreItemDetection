@@ -1,48 +1,78 @@
 from collections.abc import Sequence
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple, Dict, Union
 import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 
-from .utils.misc import Conv2dNormActivation, SqueezeExcitation as SElayer
+from .utils.misc import Conv2dNormActivation, SqueezeExcitation
 from .utils.utils import _make_divisible
-
+from .attention_modules import SpatialAttention, AttentionPooling
+from .color_encoder import ColorEncoder
 
 class ArcMarginProduct(nn.Module):
     """
     ArcFace head: L2-norm weight + margin m + scale s.
+    Numerically stable version to prevent NaN issues.
     """
 
-    def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.5):
+    def __init__(self, in_features: int, out_features: int, s: float = 30.0, m: float = 0.5, easy_margin: bool = False):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.s = s
         self.m = m
+        self.easy_margin = easy_margin
 
         self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
         nn.init.xavier_uniform_(self.weight)
 
+        # Precompute margin terms (updated via set_margin for warm-up)
         self.cos_m = math.cos(m)
         self.sin_m = math.sin(m)
         self.th = math.cos(math.pi - m)
         self.mm = math.sin(math.pi - m) * m
 
+    def set_margin(self, m: float) -> None:
+        """
+        Update ArcFace margin at runtime (e.g., linear warm-up).
+        IMPORTANT: must refresh cached trig terms, not just self.m.
+        """
+        self.m = float(m)
+        self.cos_m = math.cos(self.m)
+        self.sin_m = math.sin(self.m)
+        self.th = math.cos(math.pi - self.m)
+        self.mm = math.sin(math.pi - self.m) * self.m
+
     def forward(self, embedding: Tensor, label: Tensor) -> Tensor:
-        # embedding is already L2-normalized; normalize weight as well
+        # 1. Normalize inputs
         cosine = F.linear(F.normalize(embedding), F.normalize(self.weight))
-        sine = torch.sqrt(torch.clamp(1.0 - cosine ** 2, min=0.0))
+        
+        # 2. Clamp cosine để tránh lỗi số học (quan trọng!)
+        # float16 có thể làm cosine > 1.0 hoặc < -1.0 một chút xíu -> gây NaN
+        cosine = torch.clamp(cosine, -1.0 + 1e-7, 1.0 - 1e-7)
+        
+        # 3. Tính Sine an toàn
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2))
+        
+        # 4. Công thức ArcFace: cos(theta + m) = cos(theta)cos(m) - sin(theta)sin(m)
         phi = cosine * self.cos_m - sine * self.sin_m
-        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
-
+        
+        if self.easy_margin:
+            phi = torch.where(cosine > 0, phi, cosine)
+        else:
+            phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+            
+        # 5. Convert label to one-hot (use same device as cosine)
         one_hot = torch.zeros_like(cosine)
-        one_hot.scatter_(1, label.view(-1, 1), 1.0)
-
-        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        one_hot.scatter_(1, label.view(-1, 1).long(), 1)
+        
+        # 6. Final output
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine) 
         output *= self.s
+        
         return output
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
@@ -148,7 +178,7 @@ class InvertedResidual(nn.Module):
         self,
         cnf: InvertedResidualConfig,
         norm_layer: Callable[..., nn.Module],
-        se_layer: Callable[..., nn.Module] = partial(SElayer, scale_activation=nn.Hardsigmoid),
+        se_layer: Callable[..., nn.Module] = partial(SqueezeExcitation, scale_activation=nn.Hardsigmoid),
     ):
         super().__init__()
         if not (1 <= cnf.stride <= 2):
@@ -251,6 +281,10 @@ class ResMobileNetV2(nn.Module):
         block: Optional[Callable[..., nn.Module]] = None,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         num_classes: int = 1000,
+        use_attention: bool = True,
+        use_color_embedding: bool = True,
+        color_embedding_size: int = 128,
+        store_original_input: bool = True,  # Store original input for color encoder
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -340,11 +374,30 @@ class ResMobileNetV2(nn.Module):
             norm_layer=norm_layer,
         )
 
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        # Attention modules
+        self.use_attention = use_attention
+        if use_attention:
+            self.spatial_attention = SpatialAttention(kernel_size=7)
+            self.attention_pooling = AttentionPooling(input_channels)
+        else:
+            self.avgpool = nn.AdaptiveAvgPool2d(1)
+        
+        # Visual embedding head (thêm dropout để giảm overfitting)
         self.fc_1 = nn.Linear(input_channels, embedding_size)
         self.batch_norm_1 = nn.BatchNorm1d(embedding_size)
         self.relu_1 = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(0.3)  # Dropout để giảm overfitting
 
+        # Color embedding (shallow CNN - learnable)
+        # ⚠️ QUAN TRỌNG: Color KHÔNG đi vào ArcFace, chỉ dùng cho final embedding (retrieval)
+        self.use_color_embedding = use_color_embedding
+        if use_color_embedding:
+            self.color_encoder = ColorEncoder(embedding_size=color_embedding_size)
+            # Color weight for final embedding: α ≈ 0.3-0.5 (tune based on validation)
+            self.color_alpha = 0.3  # Can be made learnable or tuned as hyperparameter
+
+        # ArcFace head (CHỈ nhận visual embedding - không phải fused)
+        # ArcFace = shape/identity classifier, color = attribute (phân tách rõ ràng)
         self.arcface_head = ArcMarginProduct(
             in_features=embedding_size, out_features=num_classes, s=30.0, m=0.35
         )
@@ -384,22 +437,125 @@ class ResMobileNetV2(nn.Module):
         return x
 
     def _forward_impl(self, x: Tensor) -> Tensor:
-        x = self.resnet_stem(x)
-        x = self.get_mobile_features(x)
-        x = self.resnet_tail(x)
+        """
+        Forward pass returning VISUAL embedding only (for ArcFace training)
+        
+        ⚠️ QUAN TRỌNG: 
+        - ArcFace CHỈ nhận visual embedding (shape/identity)
+        - Color embedding KHÔNG đi vào ArcFace (tránh phá decision boundary)
+        - Color chỉ dùng cho final embedding ở inference (retrieval)
+        """
+        # Visual branch: ResNet stem → MobileNet → ResNet tail
+        features = self.resnet_stem(x)
+        features = self.get_mobile_features(features)
+        features = self.resnet_tail(features)
 
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)
+        # Apply spatial attention (focus on logo regions)
+        if self.use_attention:
+            features = self.spatial_attention(features)
+            # Attention-based pooling instead of GAP
+            pooled = self.attention_pooling(features)  # (B, C)
+        else:
+            pooled = self.avgpool(features)
+            pooled = torch.flatten(pooled, 1)  # (B, C)
 
-        x = self.fc_1(x)
+        # Visual embedding
+        x = self.fc_1(pooled)
         x = self.batch_norm_1(x)
         x = self.relu_1(x)
+        x = self.dropout(x)  # Apply dropout để giảm overfitting
+        visual_embedding = F.normalize(x, p=2, dim=1)  # (B, embedding_size)
 
-        embedding = F.normalize(x, p=2, dim=1)
-        return embedding
+        return visual_embedding
+    
+    def get_final_embedding(self, x: Tensor) -> Tensor:
+        """
+        Get final embedding for retrieval (visual + color weighted)
+        
+        This is used at inference time for similarity search.
+        Color embedding được weighted với alpha để không làm lệch quá visual.
+        
+        Returns:
+            final_embedding: (B, embedding_size + color_embedding_size) normalized
+        """
+        original_input = x
+        
+        # Get visual embedding
+        visual_emb = self._forward_impl(x)  # (B, embedding_size)
+        
+        if self.use_color_embedding:
+            color_emb = self.color_encoder(original_input)  # (B, color_embedding_size)
+            
+            # Weighted concat: visual + color * alpha
+            # α = 0.3 nghĩa là color chiếm ~23% contribution (0.3/(1+0.3))
+            weighted_color = color_emb * self.color_alpha
+            final_emb = torch.cat([visual_emb, weighted_color], dim=1)  # (B, embedding_size + color_embedding_size)
+            final_emb = F.normalize(final_emb, p=2, dim=1)
+        else:
+            final_emb = visual_emb
+        
+        return final_emb
+    
+    def _forward_dual(self, x: Tensor, original_input: Optional[Tensor] = None) -> Tuple[Tensor, Optional[Tensor]]:
+        """
+        Forward pass returning both visual and color embeddings (for evaluation/inference)
+        
+        Args:
+            x: Input tensor (B, 3, H, W) - normalized image
+            original_input: Original input tensor for color encoder (if None, use x)
+        
+        Returns:
+            visual_embedding: (B, embedding_size)
+            color_embedding: (B, color_embedding_size) or None
+        """
+        # Store original input for color encoder
+        if original_input is None:
+            original_input = x
+        
+        # Visual branch: ResNet stem → MobileNet → ResNet tail
+        features = self.resnet_stem(x)
+        features = self.get_mobile_features(features)
+        features = self.resnet_tail(features)
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+        # Apply spatial attention (focus on logo regions)
+        if self.use_attention:
+            features = self.spatial_attention(features)
+            # Attention-based pooling instead of GAP
+            pooled = self.attention_pooling(features)  # (B, C)
+        else:
+            pooled = self.avgpool(features)
+            pooled = torch.flatten(pooled, 1)  # (B, C)
+
+        # Visual embedding
+        x = self.fc_1(pooled)
+        x = self.batch_norm_1(x)
+        x = self.relu_1(x)
+        x = self.dropout(x)  # Apply dropout để giảm overfitting
+        visual_embedding = F.normalize(x, p=2, dim=1)  # (B, embedding_size)
+
+        # Color embedding (separate branch - uses original input image)
+        color_embedding = None
+        if self.use_color_embedding:
+            color_embedding = self.color_encoder(original_input)  # (B, color_embedding_size)
+
+        return visual_embedding, color_embedding
+
+    def forward(self, x: Tensor, return_color: bool = False) -> Union[Tensor, Tuple[Tensor, Optional[Tensor]]]:
+        """
+        Forward pass
+        
+        Args:
+            x: Input tensor (B, 3, H, W) - normalized image
+            return_color: If True, return both visual and color embeddings
+        
+        Returns:
+            If return_color=False: visual_embedding (B, embedding_size)
+            If return_color=True: (visual_embedding, color_embedding)
+        """
+        if return_color:
+            return self._forward_dual(x, original_input=x)
+        else:
+            return self._forward_impl(x)
 
 @torch.no_grad()
 def get_embeddings(model, data_loader, device):

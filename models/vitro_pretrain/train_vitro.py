@@ -16,13 +16,15 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
-
+from models.losses.supcon_loss import SupConLoss
 
 class VitroDataset(Dataset):
     def __init__(self, data_dir: str, transform=None):
@@ -77,7 +79,7 @@ class VitroDataset(Dataset):
 def create_data_loaders(
     data_dir: str,
     batch_size: int = 32,
-    num_workers: int = 4,
+    num_workers: int = 8,  # Tăng từ 4 lên 8 để tăng tốc data loading
     train_split: float = 0.7,
     val_split: float = 0.15,
     test_split: float = 0.15
@@ -94,7 +96,6 @@ def create_data_loaders(
         transforms.Resize(256),
         transforms.RandomCrop(224),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
@@ -130,19 +131,29 @@ def create_data_loaders(
     val_dataset.dataset.transform = transform_val
     test_dataset.dataset.transform = transform_test
     
+    # Trên Kaggle/Colab, persistent_workers có thể gây lỗi
+    # Tắt persistent_workers để tránh worker crash (trade-off: hơi chậm hơn một chút)
+    use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
+    
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None  # None nếu num_workers=0
     )
     
     val_loader = DataLoader(
         val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
+        num_workers=num_workers, pin_memory=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=2 if num_workers > 0 else None
     )
     
     return train_loader, val_loader, test_loader, len(set([s[1] for s in full_dataset.samples]))
@@ -185,32 +196,88 @@ def compute_arcface_accuracy(embeddings, labels, arcface_head):
     return correct
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
-    """Train 1 epoch"""
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=True):
+    """Train 1 epoch với mixed precision để tăng tốc"""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
     
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
+    # Handle device: support both string and torch.device
+    if isinstance(device, str):
+        is_cuda = device == 'cuda' and torch.cuda.is_available()
+    else:
+        is_cuda = device.type == 'cuda'
+    
+    # Mixed precision scaler (dùng API mới để tránh deprecation warning)
+    scaler = torch.amp.GradScaler('cuda') if use_amp and is_cuda else None
+    
+    # Classifier warm-up (CE head) to stabilize embedding distribution before ArcFace
+    ce_warmup_epochs = int(getattr(model, "ce_warmup_epochs", 0) or 0)
+    ce_head = getattr(model, "ce_head", None)
+
+    # SupCon (loss phụ) - train color branch trên final embedding, không phá ArcFace boundary
+    # Nếu model không bật color embedding hoặc supcon_lambda=0, loss_supcon sẽ bị skip.
+    supcon_lambda = getattr(model, "supcon_lambda", 0.0)
+    supcon_criterion = getattr(model, "supcon_criterion", None)
+
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)  # leave=False để không spam terminal
     for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)  # non_blocking=True để tăng tốc transfer
+        labels = labels.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        # Forward: lấy embedding và logits từ ArcFace
-        embeddings = model(images)
-        logits = model.arcface_head(embeddings, labels)
+        # Mixed precision forward
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                embeddings = model(images)
+                # Warm-up: CE head first, then ArcFace
+                if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
+                    logits = ce_head(embeddings)
+                else:
+                    logits = model.arcface_head(embeddings, labels)
+                loss_arc = criterion(logits, labels)
+
+                # SupCon on final embedding (visual ⊕ α·color)
+                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                    final_emb = model.get_final_embedding(images)
+                    loss_sup = supcon_criterion(final_emb, labels)
+                else:
+                    loss_sup = loss_arc.new_tensor(0.0)
+
+                loss = loss_arc + (supcon_lambda * loss_sup)
+            
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)  # Unscale trước khi clip
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            embeddings = model(images)
+            if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
+                logits = ce_head(embeddings)
+            else:
+                logits = model.arcface_head(embeddings, labels)
+            loss_arc = criterion(logits, labels)
+
+            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                final_emb = model.get_final_embedding(images)
+                loss_sup = supcon_criterion(final_emb, labels)
+            else:
+                loss_sup = loss_arc.new_tensor(0.0)
+
+            loss = loss_arc + (supcon_lambda * loss_sup)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
         
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
-        
-        # Stats
         running_loss += loss.item()
         total += labels.size(0)
-        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
+        # Accuracy based on current logits (works for CE warmup + ArcFace)
+        with torch.no_grad():
+            pred = logits.argmax(dim=1)
+            correct += pred.eq(labels).sum().item()
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -218,31 +285,69 @@ def train_epoch(model, train_loader, criterion, optimizer, device, epoch):
         })
     
     epoch_loss = running_loss / len(train_loader)
-    epoch_acc = 100. * correct / total
+    epoch_acc = 100. * correct / total if total > 0 else 0.0
     return epoch_loss, epoch_acc
 
 
 @torch.no_grad()
-def validate(model, val_loader, criterion, device):
-    """Validate model"""
+def validate(model, val_loader, criterion, device, epoch: int = 0, use_amp=True):
+    """Validate model với mixed precision để tăng tốc"""
     model.eval()
+    supcon_lambda = getattr(model, "supcon_lambda", 0.0)
+    supcon_criterion = getattr(model, "supcon_criterion", None)
+    ce_warmup_epochs = int(getattr(model, "ce_warmup_epochs", 0) or 0)
+    ce_head = getattr(model, "ce_head", None)
     running_loss = 0.0
     correct = 0
     total = 0
     
-    pbar = tqdm(val_loader, desc="[Val]")
+    # Handle device: support both string and torch.device
+    if isinstance(device, str):
+        is_cuda = device == 'cuda' and torch.cuda.is_available()
+    else:
+        is_cuda = device.type == 'cuda'
+    
+    pbar = tqdm(val_loader, desc="[Val]", leave=False)  # leave=False
     for images, labels in pbar:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)  # non_blocking=True
+        labels = labels.to(device, non_blocking=True)
         
-        embeddings = model(images)
-        logits = model.arcface_head(embeddings, labels)
-        
-        loss = criterion(logits, labels)
+        if use_amp and is_cuda:
+            with torch.cuda.amp.autocast():
+                embeddings = model(images)
+                if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
+                    logits = ce_head(embeddings)
+                else:
+                    logits = model.arcface_head(embeddings, labels)
+                loss_arc = criterion(logits, labels)
+
+                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                    final_emb = model.get_final_embedding(images)
+                    loss_sup = supcon_criterion(final_emb, labels)
+                else:
+                    loss_sup = loss_arc.new_tensor(0.0)
+
+                loss = loss_arc + (supcon_lambda * loss_sup)
+        else:
+            embeddings = model(images)
+            if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
+                logits = ce_head(embeddings)
+            else:
+                logits = model.arcface_head(embeddings, labels)
+            loss_arc = criterion(logits, labels)
+
+            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
+                final_emb = model.get_final_embedding(images)
+                loss_sup = supcon_criterion(final_emb, labels)
+            else:
+                loss_sup = loss_arc.new_tensor(0.0)
+
+            loss = loss_arc + (supcon_lambda * loss_sup)
         
         running_loss += loss.item()
         total += labels.size(0)
-        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
+        pred = logits.argmax(dim=1)
+        correct += pred.eq(labels).sum().item()
         
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
@@ -369,6 +474,51 @@ def compute_mean_average_precision(test_emb, gallery_emb, test_labels, gallery_l
     map_score = sum(aps) / len(aps)
     return map_score
 
+def plot_training_curves(train_acc_history, val_acc_history, train_loss_history, val_loss_history, save_path=None):
+    """
+    Plot biểu đồ training curves: accuracy và loss
+    Nếu save_path=None thì chỉ hiển thị, không lưu file
+    """
+    epochs = range(1, len(train_acc_history) + 1)
+    
+    # Tạo figure với 2 subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    # Plot Accuracy
+    ax1.plot(epochs, train_acc_history, 'b-', label='Train Accuracy', linewidth=2, marker='o', markersize=4)
+    ax1.plot(epochs, val_acc_history, 'r-', label='Validation Accuracy', linewidth=2, marker='s', markersize=4)
+    
+    # Highlight best validation accuracy
+    if val_acc_history:
+        best_val_acc = max(val_acc_history)
+        best_epoch = val_acc_history.index(best_val_acc) + 1
+        ax1.axvline(x=best_epoch, color='green', linestyle='--', alpha=0.5, linewidth=1.5)
+        ax1.plot(best_epoch, best_val_acc, 'go', markersize=10, label=f'Best Val Acc: {best_val_acc:.2f}%')
+    
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Accuracy (%)', fontsize=12)
+    ax1.set_title('Training and Validation Accuracy', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=11, loc='best')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim([1, len(epochs)])
+    
+    # Plot Loss
+    ax2.plot(epochs, train_loss_history, 'b-', label='Train Loss', linewidth=2, marker='o', markersize=4)
+    ax2.plot(epochs, val_loss_history, 'r-', label='Validation Loss', linewidth=2, marker='s', markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Loss', fontsize=12)
+    ax2.set_title('Training and Validation Loss', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=11, loc='best')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim([1, len(epochs)])
+    
+    plt.tight_layout()
+    
+    # Hiển thị biểu đồ thay vì lưu ảnh
+    print(f"   📈 Training curves plotted successfully")
+    print(f"   👁️  Đang hiển thị biểu đồ...")
+    plt.show()
+
 
 @torch.no_grad()
 def evaluate_test(model, test_loader, train_loader, criterion, device):
@@ -426,10 +576,22 @@ def main():
                         help='Number of training epochs')
     parser.add_argument('--batch-size', type=int, default=32,
                         help='Batch size')
-    parser.add_argument('--lr', type=float, default=0.001,
+    parser.add_argument('--lr', type=float, default=0.0002,  # scratch + ArcFace ổn định hơn
                         help='Learning rate')
     parser.add_argument('--embedding-size', type=int, default=512,
                         help='Embedding dimension')
+    parser.add_argument('--use-color-embedding', action='store_true',
+                        help='Enable ColorEncoder and final embedding concat (visual ⊕ α·color)')
+    parser.add_argument('--color-embedding-size', type=int, default=64,
+                        help='Color embedding dimension (default: 64)')
+    parser.add_argument('--color-alpha', type=float, default=0.3,
+                        help='Scale for color embedding in final embedding (default: 0.3)')
+    parser.add_argument('--supcon-lambda', type=float, default=0.0,
+                        help='Weight for SupCon loss on final embedding (default: 0.0 = off)')
+    parser.add_argument('--supcon-temp', type=float, default=0.07,
+                        help='Temperature for SupCon loss (default: 0.07)')
+    parser.add_argument('--num-workers', type=int, default=8,
+                        help='Number of DataLoader workers (default: 8, tăng lên nếu có nhiều CPU cores)')
     parser.add_argument('--freeze-stem', action='store_true',
                         help='Freeze ResNet stem layers')
     parser.add_argument('--freeze-mobile', action='store_true',
@@ -438,6 +600,21 @@ def main():
                         help='Resume from checkpoint')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
+
+    parser.add_argument('--arcface-margin-start', type=float, default=None,
+                        help='ArcFace margin warmup start (e.g., 0.0). If set, enables warm-up.')
+    parser.add_argument('--arcface-margin-end', type=float, default=0.35,
+                        help='ArcFace margin warmup end (e.g., 0.35 or 0.5)')
+    parser.add_argument('--arcface-warmup-epochs', type=int, default=10,
+                        help='Number of epochs for linear margin warmup')
+
+    # CE classifier warm-up (recommended for scratch + ArcFace)
+    parser.add_argument('--ce-warmup-epochs', type=int, default=5,
+                        help='Warm-up epochs using plain CE head before ArcFace (default: 5)')
+    parser.add_argument('--arcface-scale', type=float, default=20.0,
+                        help='ArcFace scale s (default: 20.0)')
+    parser.add_argument('--arcface-margin', type=float, default=0.30,
+                        help='ArcFace margin m for Vitro stage (default: 0.30)')
     
     args = parser.parse_args()
     
@@ -445,7 +622,7 @@ def main():
     
     print("📦 Loading dataset...")
     train_loader, val_loader, test_loader, num_classes = create_data_loaders(
-        args.data_dir, batch_size=args.batch_size
+        args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers
     )
     print(f"   Classes: {num_classes}")
     print(f"   Train samples: {len(train_loader.dataset)}")
@@ -457,20 +634,54 @@ def main():
     model = ResMobileNetV2(
         inverted_residual_setting=inverted_residual_setting,
         embedding_size=args.embedding_size,
-        num_classes=num_classes
+        num_classes=num_classes,
+        use_color_embedding=args.use_color_embedding,
+        color_embedding_size=args.color_embedding_size
     ).to(args.device)
+
+    # Attach SupCon config to model (simple wiring without refactoring train_epoch signature)
+    model.color_alpha = args.color_alpha if hasattr(model, "color_alpha") else args.color_alpha
+    model.supcon_lambda = float(args.supcon_lambda)
+    model.supcon_criterion = SupConLoss(temperature=args.supcon_temp) if args.supcon_lambda > 0 else None
+
+    # Attach CE warmup head + ArcFace hyperparams
+    model.ce_warmup_epochs = int(args.ce_warmup_epochs)
+    model.ce_head = nn.Linear(args.embedding_size, num_classes).to(args.device) if args.ce_warmup_epochs > 0 else None
+    model.arcface_head.s = float(args.arcface_scale)
+    if hasattr(model.arcface_head, "set_margin"):
+        model.arcface_head.set_margin(float(args.arcface_margin))
+    else:
+        model.arcface_head.m = float(args.arcface_margin)
     
     if args.freeze_stem or args.freeze_mobile:
         freeze_layers(model, freeze_stem=args.freeze_stem, freeze_mobile=args.freeze_mobile)
     
-    criterion = nn.CrossEntropyLoss()
+    # ✨ Tối ưu: Compile model nếu PyTorch >= 2.0 (tăng tốc ~20-30%)
+    if hasattr(torch, 'compile') and args.device == 'cuda':
+        try:
+            print("   ⚡ Compiling model with torch.compile()...")
+            model = torch.compile(model, mode='reduce-overhead')  # hoặc 'default', 'max-autotune'
+            print("   ✅ Model compiled successfully")
+        except Exception as e:
+            print(f"   ⚠️  torch.compile() failed: {e}, continuing without compilation")
+    
+    # Label smoothing để giảm overfitting (giảm confidence quá cao)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
+    if getattr(model, "ce_head", None) is not None:
+        trainable_params += [p for p in model.ce_head.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=args.lr, weight_decay=5e-4)  # Tăng weight decay
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     
     start_epoch = 0
     best_val_acc = 0.0
+    
+    # Lưu history để plot biểu đồ
+    train_acc_history = []
+    val_acc_history = []
+    train_loss_history = []
+    val_loss_history = []
     
     if args.resume:
         print(f"📂 Loading checkpoint: {args.resume}")
@@ -488,9 +699,20 @@ def main():
     print(f"   Batch size: {args.batch_size}\n")
     
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, args.device, epoch)
+        # ArcFace margin warm-up: epoch 0..warmup: m from start->end
+        if args.arcface_margin_start is not None and hasattr(model, "arcface_head"):
+            warm = max(int(args.arcface_warmup_epochs), 1)
+            t = min(max(epoch / warm, 0.0), 1.0)
+            m = float(args.arcface_margin_start + t * (args.arcface_margin_end - args.arcface_margin_start))
+            if hasattr(model.arcface_head, "set_margin"):
+                model.arcface_head.set_margin(m)
+            else:
+                # fallback (older ArcFace): best-effort
+                model.arcface_head.m = m
+
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, args.device, epoch, use_amp=True)
         
-        val_loss, val_acc = validate(model, val_loader, criterion, args.device)
+        val_loss, val_acc = validate(model, val_loader, criterion, args.device, epoch=epoch, use_amp=True)
         
         scheduler.step()
         
@@ -498,6 +720,12 @@ def main():
         print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         print(f"  LR: {scheduler.get_last_lr()[0]:.6f}\n")
+        
+        # Lưu vào history
+        train_acc_history.append(train_acc)
+        val_acc_history.append(val_acc)
+        train_loss_history.append(train_loss)
+        val_loss_history.append(val_loss)
         
         checkpoint = {
             'epoch': epoch,
@@ -539,6 +767,14 @@ def main():
     best_checkpoint['test_recall_at_5'] = test_results['recall_at_5']
     best_checkpoint['test_mean_average_precision'] = test_results['mean_average_precision']
     torch.save(best_checkpoint, os.path.join(args.output_dir, 'best.pth'))
+    
+    # Plot biểu đồ training history
+    print(f"\n📊 Plotting training curves...")
+    plot_training_curves(
+        train_acc_history, val_acc_history,
+        train_loss_history, val_loss_history,
+        save_path=None  # Không lưu ảnh, chỉ hiển thị
+    )
     
     print(f"\n🎉 Training completed!")
     print(f"   Best Val Acc: {best_val_acc:.2f}%")

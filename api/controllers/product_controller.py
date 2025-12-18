@@ -11,12 +11,11 @@ from qdrant_utils.qdrant_client import (
     initialize_model,      # kept for compatibility
     save_embedding_to_qdrant,
     search_similar,
-    search_with_rerank,
     get_model,
     get_qdrant_client,
 )
 from database import get_db
-from schemas.schema import ProductCreate, ProductResponse, ProductUpdate
+from schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult
 from services.product_service import ProductService
 
 router = APIRouter(
@@ -132,7 +131,6 @@ def create_product(
 
 
 
-
 @router.post(
     "/search",
     response_model=List[ProductResponse]
@@ -178,98 +176,52 @@ def list_products(
     return service.list_products(skip=skip, limit=limit)
 
 
-# ------------------------------
-# Search similar products via Qdrant (cosine, top-K, no threshold)
-# ------------------------------
-@router.post(
-    "/search",
-    summary="Search similar products by image",
-    description="Upload an image, returns top-K similar products from Qdrant using cosine distance.",
-)
-async def search_products(
-    file: UploadFile = File(..., description="Query image file"),
-    top_k: int = Query(20, ge=1, le=100, description="Number of results to return"),
-):
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    ext = file.filename.split(".")[-1].lower()
-    filename = f"{uuid.uuid4()}.{ext}"
-    file_path = os.path.join(upload_dir, filename)
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-
-    model = get_model()
-    client = get_qdrant_client()
-    if model is None or client is None:
-        raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
-
-    try:
-        hits = search_similar(model, client, file_path, top_k=top_k)
-        return {"results": hits}
-    finally:
-        # optional: keep file for audit? For now, remove temp
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
 
 
 # ------------------------------
-# Search with Enterprise Rerank Flow (Global → Local Features → Color → Fusion)
+# Search similar products by image with ProductSearchResult
 # ------------------------------
 @router.post(
-    "/search-rerank",
-    summary="Search products with Enterprise Rerank Flow"
+        "/search-by-image",
+        response_model=List[ProductSearchResult],
+    summary="Search products by image using embedding similarity",
+    description="Upload an image, returns top-K similar products from Qdrant with similarity threshold and scores."
 )
-async def search_products_rerank(
-    file: UploadFile = File(..., description="Query image file"),
-    top_k: int = Query(200, ge=1, le=500, description="Top-K candidates from Global Retrieval (Qdrant)"),
-    local_weight: float = Query(0.55, ge=0.0, le=1.0, description="Weight for local feature score - BRAND (default: 0.55)"),
-    color_weight: float = Query(0.25, ge=0.0, le=1.0, description="Weight for color score - VARIANT (default: 0.25)"),
-    embed_weight: float = Query(0.20, ge=0.0, le=1.0, description="Weight for embedding score - SEMANTIC (default: 0.20)"),
-    fusion_threshold: float = Query(0.0, ge=0.0, le=1.0, description="Filter results below this final score"),
+async def search_product_by_image(
+    image: UploadFile = File(..., description="Query image file"),
+    k: int = Query(20, ge=1, le=100, description="Number of results to return (top-K)"),
+    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score threshold"),
     db: Session = Depends(get_db)
 ):
+
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    ext = file.filename.split(".")[-1].lower()
+    ext = image.filename.split(".")[-1].lower()
     filename = f"{uuid.uuid4()}.{ext}"
     file_path = os.path.join(upload_dir, filename)
-    with open(file_path, "wb") as f:
-        f.write(await file.read())
-
-    model = get_model()
-    client = get_qdrant_client()
-    if model is None or client is None:
-        raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
-
-    # Validate weights sum to ~1.0 (allow small tolerance)
-    weight_sum = local_weight + color_weight + embed_weight
-    if abs(weight_sum - 1.0) > 0.1:
-        # Normalize weights
-        local_weight = local_weight / weight_sum if weight_sum > 0 else 0.55
-        color_weight = color_weight / weight_sum if weight_sum > 0 else 0.25
-        embed_weight = embed_weight / weight_sum if weight_sum > 0 else 0.20
-
+    
     try:
-        reranked_hits = search_with_rerank(
-            model,
-            client,
-            file_path,
-            top_k=top_k,
-            local_weight=local_weight,
-            color_weight=color_weight,
-            embed_weight=embed_weight,
-            fusion_threshold=fusion_threshold,
-        )
+        with open(file_path, "wb") as f:
+            f.write(await image.read())
         
-        # Lấy product info từ DB
+        # Get model and Qdrant client
+        model = get_model()
+        client = get_qdrant_client()
+        if model is None or client is None:
+            raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
+        
+        # Search similar embeddings
+        hits = search_similar(model, client, file_path, top_k=k)
+        
+        # Filter by threshold and get product IDs
+        filtered_hits = [hit for hit in hits if hit.get("score", 0.0) >= threshold]
+        
         service = ProductService(db)
         results = []
         seen_product_ids = set()
         
-        for hit in reranked_hits:
-            product_id = hit.get('payload', {}).get('product_id')
+        for hit in filtered_hits:
+            product_id = hit.get("payload", {}).get("product_id")
             if not product_id or product_id in seen_product_ids:
                 continue
             
@@ -277,38 +229,28 @@ async def search_products_rerank(
                 product = service.get_product(product_id)
                 seen_product_ids.add(product_id)
                 
-                result_item = {
-                    "product_id": product_id,
-                    "product_name": product.name,
-                    "product_price": product.price,
-                    "product_description": product.description,
-                    "image_path": hit.get("payload", {}).get("image_path"),
-                    "embed_score": hit.get("embed_score"),
-                    "local_score": hit.get("local_score"),
-                    "color_score": hit.get("color_score"),
-                    "final_score": hit.get("final_score"),
-                    # Optional: include detailed scores
-                    "local_details": hit.get("local_details", {}),
-                    "color_details": hit.get("color_details", {}),
-                }
+                # Get similarity score
+                score = hit.get("score", 0.0)
+                similarity_percent = score * 100.0
                 
-                results.append(result_item)
+                results.append(ProductSearchResult(
+                    product=product,
+                    score=score,
+                    similarity_percent=similarity_percent
+                ))
             except HTTPException:
-                # Product không tồn tại trong DB, skip
+                # Product not found in DB, skip
                 continue
         
-        return {
-            "results": results,
-            "total_found": len(results),
-            "top_k": top_k,
-            "local_weight": local_weight,
-            "color_weight": color_weight,
-            "embed_weight": embed_weight,
-            "fusion_threshold": fusion_threshold
-        }
+        # Sort by score descending (highest similarity first)
+        results.sort(key=lambda x: x.score, reverse=True)
+        
+        return results
     finally:
+        # Clean up temp file
         try:
-            os.remove(file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
         except OSError:
             pass
 

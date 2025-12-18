@@ -10,7 +10,6 @@ from .utils import _log_api_usage_once, _make_ntuple
 
 interpolate = torch.nn.functional.interpolate
 
-
 class FrozenBatchNorm2d(torch.nn.Module):
     """
     BatchNorm2d where the batch statistics and the affine parameters are fixed
