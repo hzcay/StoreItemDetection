@@ -12,7 +12,7 @@ import torch.nn as nn
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
-
+import io
 # -------------------------------
 # Qdrant configuration
 # -------------------------------
@@ -119,43 +119,56 @@ def get_qdrant_client() -> Optional[QdrantClient]:
 # -------------------------------
 # Extract embedding
 # -------------------------------
-def get_image_embedding(image_path: str, model: nn.Module, return_color: bool = False) -> Union[np.ndarray, Tuple[np.ndarray, Optional[np.ndarray]]]:
+def get_image_embedding(
+    image_bytes: bytes,
+    model: nn.Module,
+    return_color: bool = False
+) -> Union[np.ndarray, Tuple[np.ndarray, Optional[np.ndarray]]]:
     """
-    Extract embedding(s) from image for Late Fusion
-    
+    Extract embedding(s) from image bytes for Late Fusion.
+
     Returns:
-        If return_color=False: visual_embedding (embedding_size,)
-        If return_color=True: (visual_embedding, color_embedding) - both normalized
+        If return_color=False:
+            visual_embedding (embedding_size,)
+        If return_color=True:
+            (visual_embedding, color_embedding)
     """
-    img = Image.open(image_path).convert('RGB')
+
+    # Load image from memory
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+    # Apply same transform used in training
     img_tensor = transform(img).unsqueeze(0).to(DEVICE)
-    
+
     with torch.no_grad():
         if return_color:
             visual_emb, color_emb = model(img_tensor, return_color=True)
+
+            # ---- Visual embedding ----
             visual_emb = visual_emb.squeeze()
             visual_emb = F.normalize(visual_emb, p=2, dim=0)
             visual_emb = visual_emb.cpu().numpy().astype(np.float32)
-            
+
+            # ---- Color embedding ----
             if color_emb is not None:
                 color_emb = color_emb.squeeze()
                 color_emb = F.normalize(color_emb, p=2, dim=0)
                 color_emb = color_emb.cpu().numpy().astype(np.float32)
             else:
                 color_emb = None
-            
+
             return visual_emb, color_emb
+
         else:
             visual_emb = model(img_tensor).squeeze()
             visual_emb = F.normalize(visual_emb, p=2, dim=0)
             visual_emb = visual_emb.cpu().numpy().astype(np.float32)
             return visual_emb
 
-
 def search_similar(
     model: nn.Module,
     client: QdrantClient,
-    image_path: str,
+    image_bytes: bytes,     # 🔒 BYTES ONLY
     top_k: int = 20,
     visual_weight: float = 0.6,
     color_weight: float = 0.4
@@ -164,92 +177,91 @@ def search_similar(
         raise RuntimeError("Qdrant client not initialized")
     if model is None:
         raise RuntimeError("Model not initialized")
-    
-    # Validate weights
-    if abs(visual_weight + color_weight - 1.0) > 0.01:
-        total = visual_weight + color_weight
-        visual_weight = visual_weight / total
-        color_weight = color_weight / total
-    
+    if not isinstance(image_bytes, (bytes, bytearray)):
+        raise TypeError(f"image_bytes must be bytes, got {type(image_bytes)}")
+
+    # Normalize weights
+    total = visual_weight + color_weight
+    if abs(total - 1.0) > 0.01:
+        visual_weight /= total
+        color_weight /= total
+
     # Check collection
     try:
         collections = client.get_collections()
-        collection_names = [c.name for c in collections.collections]
-        if QDRANT_COLLECTION not in collection_names:
+        names = [c.name for c in collections.collections]
+        if QDRANT_COLLECTION not in names:
             return []
-        
-        collection_info = client.get_collection(QDRANT_COLLECTION)
-        point_count = collection_info.points_count if hasattr(collection_info, 'points_count') else 0
-        if point_count == 0:
+
+        info = client.get_collection(QDRANT_COLLECTION)
+        if getattr(info, "points_count", 0) == 0:
             return []
-        
-        config = collection_info.config if hasattr(collection_info, 'config') else None
-        uses_named_vectors = False
-        if config and hasattr(config, 'params') and hasattr(config.params, 'vectors'):
-            vectors_config = config.params.vectors
-            uses_named_vectors = isinstance(vectors_config, dict) and 'visual' in vectors_config
-        
-        if not uses_named_vectors:
-            raise RuntimeError("Collection must use named vectors for Late Fusion")
+
+        vectors_cfg = info.config.params.vectors
+        if not isinstance(vectors_cfg, dict) or "visual" not in vectors_cfg:
+            raise RuntimeError("Collection must use named vectors: visual + color")
+
     except Exception as e:
-        print(f"Error checking collection: {e}")
+        print(f"❌ Collection check failed: {e}")
         return []
-    
+
     # Extract embeddings
     try:
-        has_color = hasattr(model, 'use_color_embedding') and model.use_color_embedding
-        if not has_color:
-            raise RuntimeError("Model must have color embedding for Late Fusion")
-        
-        query_visual, query_color = get_image_embedding(image_path, model, return_color=True)
+        if not getattr(model, "use_color_embedding", False):
+            raise RuntimeError("Model must support color embedding")
+
+        query_visual, query_color = get_image_embedding(
+            image_bytes=image_bytes,
+            model=model,
+            return_color=True
+        )
+
         if query_color is None:
-            raise RuntimeError("Failed to extract color embedding")
+            raise RuntimeError("Color embedding missing")
+
     except Exception as e:
-        print(f"Error extracting embeddings: {e}")
+        print(f"❌ Embedding error: {e}")
         return []
-    
-    # Get all points and compute Late Fusion scores
+
+    # Scroll points
     try:
-        all_points, _ = client.scroll(
+        points, _ = client.scroll(
             collection_name=QDRANT_COLLECTION,
             limit=10000,
             with_payload=True,
             with_vectors=True
         )
     except Exception as e:
-        print(f"Error scrolling collection: {e}")
+        print(f"❌ Qdrant scroll failed: {e}")
         return []
-    
-    # Compute Late Fusion scores
+
+    # Late Fusion scoring
     results = []
-    for point in all_points:
-        if not hasattr(point, 'vector') or not isinstance(point.vector, dict):
+    for p in points:
+        if not isinstance(p.vector, dict):
             continue
-        
-        stored_visual = np.array(point.vector.get('visual', []), dtype=np.float32)
-        stored_color = np.array(point.vector.get('color', []), dtype=np.float32)
-        
-        if len(stored_visual) == 0 or len(stored_color) == 0:
+
+        v = np.asarray(p.vector.get("visual"), dtype=np.float32)
+        c = np.asarray(p.vector.get("color"), dtype=np.float32)
+
+        if v.size == 0 or c.size == 0:
             continue
-        
-        # Cosine similarities (vectors already normalized)
-        visual_sim = float(np.dot(query_visual, stored_visual))
-        color_sim = float(np.dot(query_color, stored_color))
-        
-        # Late Fusion: score = α * visual_sim + β * color_sim
-        final_score = visual_weight * visual_sim + color_weight * color_sim
-        
+
+        visual_sim = float(np.dot(query_visual, v))
+        color_sim = float(np.dot(query_color, c))
+        score = visual_weight * visual_sim + color_weight * color_sim
+
         results.append({
-            "id": point.id,
-            "score": final_score,
+            "id": p.id,
+            "score": score,
             "visual_score": visual_sim,
             "color_score": color_sim,
-            "payload": getattr(point, 'payload', {})
+            "payload": p.payload or {}
         })
-    
-    # Sort and return top_k
+
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:top_k]
+
 
 
 
@@ -257,58 +269,63 @@ def save_embedding_to_qdrant(
     model: nn.Module,
     client: QdrantClient,
     product_id: int,
-    image_path: str,
+    image_bytes: bytes,
     additional_data: Optional[Dict[str, Any]] = None,
     point_id: Optional[Union[int, str]] = None,
 ) -> bool:
     if client is None:
         return False
-    
+
     try:
+        # ---- Ensure collection exists ----
         collections = client.get_collections()
         collection_names = [c.name for c in collections.collections]
-        
-        # Extract embeddings separately for Late Fusion
-        visual_emb, color_emb = get_image_embedding(image_path, model, return_color=True)
-        
+
+        # ---- Extract embeddings (Late Fusion) ----
+        visual_emb, color_emb = get_image_embedding(
+            image_bytes=image_bytes,
+            model=model,
+            return_color=True
+        )
+
         if color_emb is None:
             raise RuntimeError("Model must have color embedding for Late Fusion")
-        
-        # Create collection if needed with named vectors
+
         if QDRANT_COLLECTION not in collection_names:
-            vectors_config = {
-                "visual": VectorParams(size=len(visual_emb), distance=Distance.COSINE),
-                "color": VectorParams(size=len(color_emb), distance=Distance.COSINE)
-            }
             client.create_collection(
                 collection_name=QDRANT_COLLECTION,
-                vectors_config=vectors_config
+                vectors_config={
+                    "visual": VectorParams(
+                        size=len(visual_emb),
+                        distance=Distance.COSINE
+                    ),
+                    "color": VectorParams(
+                        size=len(color_emb),
+                        distance=Distance.COSINE
+                    ),
+                }
             )
-        
-        # Prepare payload and point with named vectors
-        payload = {
-            "product_id": product_id,
-            "image_path": image_path,
-            **(additional_data or {})
-        }
-        
-        vector_dict = {
-            "visual": visual_emb.tolist(),
-            "color": color_emb.tolist()
-        }
-        
+
+        # ---- Prepare Qdrant point ----
         point = PointStruct(
-            id=point_id if point_id is not None else product_id,
-            vector=vector_dict,
-            payload=payload
+            id=point_id or str(product_id),
+            vector={
+                "visual": visual_emb.tolist(),
+                "color": color_emb.tolist(),
+            },
+            payload={
+                "product_id": product_id,
+                **(additional_data or {})
+            }
         )
-        
+
         client.upsert(
             collection_name=QDRANT_COLLECTION,
             points=[point]
         )
-        
+
         return True
+
     except Exception as e:
-        print(f"Error saving to Qdrant: {str(e)}")
+        print(f"❌ Error saving to Qdrant: {str(e)}")
         return False

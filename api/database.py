@@ -3,9 +3,6 @@ from sqlalchemy.orm import sessionmaker
 import os
 from dotenv import load_dotenv
 
-# Import Base from models package
-from models import Base
-
 load_dotenv()
 
 # Get database configuration from environment variables

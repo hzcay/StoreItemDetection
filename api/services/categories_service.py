@@ -4,9 +4,9 @@ from typing import List, Optional
 import os
 import uuid
 
-from models import Product as ProductModel, ProductImage as ProductImageModel
-from schemas.schema import CategoryCreate, CategoryResponse
-from repositories.categories_repository import CategoriesRepository
+from api.models.models import Product as ProductModel, ProductImage as ProductImageModel
+from api.schemas.schema import CategoryCreate, CategoryResponse
+from api.repositories.categories_repository import CategoriesRepository
 
 class CategoriesService:
     def __init__(self, db: Session):

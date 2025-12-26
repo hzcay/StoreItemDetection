@@ -1,19 +1,22 @@
-import React, { useState, ChangeEvent, useEffect } from "react";
+import React, { useState, ChangeEvent, useEffect, useRef } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Search, Image as ImageIcon, X } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 
 interface ProductSearchProps {
     onTextSearch?: (text: string) => void;
-    onImageUpload?: (file: File | null) => void;
+    onImageUpload?: (file: File) => void;
 }
 
 export const ProductSearch: React.FC<ProductSearchProps> = ({
     onTextSearch,
     onImageUpload,
 }) => {
+    const fileInputRef = useRef<HTMLInputElement>(null);
     const [searchTerm, setSearchTerm] = useState("");
     const [imagePreview, setImagePreview] = useState<string | null>(null);
+    const navigate = useNavigate();
 
     // 🔹 Debounce text search
     useEffect(() => {
@@ -38,14 +41,27 @@ export const ProductSearch: React.FC<ProductSearchProps> = ({
         const url = URL.createObjectURL(file);
 
         setImagePreview(url);
-        onImageUpload?.(file);
+
+        // Call the onImageUpload prop if it exists
+        if (onImageUpload) {
+            onImageUpload(file);
+        } else {
+            // Fallback to the original behavior if onImageUpload is not provided
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                const base64String = reader.result as string;
+                sessionStorage.setItem('uploadedImage', base64String);
+                navigate('/products-image-search');
+            };
+            reader.readAsDataURL(file);
+        }
 
         e.target.value = "";
     };
 
     const clearImage = () => {
         setImagePreview(null);
-        onImageUpload?.(null);
+        sessionStorage.removeItem('uploadedImage');
     };
 
     return (
@@ -86,16 +102,16 @@ export const ProductSearch: React.FC<ProductSearchProps> = ({
                 onChange={handleFileChange}
                 className="hidden"
                 id="image-upload"
+                ref={fileInputRef}
             />
-            <label htmlFor="image-upload">
-                <Button
-                    variant="ghost"
-                    size="icon"
-                    className="absolute right-2 top-1/2 -translate-y-1/2"
-                >
-                    <ImageIcon className="h-5 w-5" />
-                </Button>
-            </label>
+            <Button
+                variant="ghost"
+                size="icon"
+                className="absolute right-2 top-1/2 -translate-y-1/2"
+                onClick={() => fileInputRef.current?.click()}
+            >
+                <ImageIcon className="h-5 w-5" />
+            </Button>
         </div>
     );
 };

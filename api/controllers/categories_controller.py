@@ -4,9 +4,9 @@ from sqlalchemy.orm import Session
 import os
 import uuid
 
-from database import get_db
-from schemas.schema import CategoryCreate, CategoryResponse
-from services.categories_service import CategoriesService
+from api.database import get_db
+from api.schemas.schema import CategoryCreate, CategoryResponse
+from api.services.categories_service import CategoriesService
 
 router = APIRouter(
     prefix="/api/categories",

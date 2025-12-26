@@ -4,13 +4,14 @@ from typing import List
 from sqlalchemy.orm import Session
 import os
 import uuid
+import io
 from typing import Optional
 from ultralytics import YOLO
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-from qdrant_utils.qdrant_client import (
+from api.qdrant_utils.qdrant_client import (
     create_qdrant_client,  # kept for compatibility
     initialize_model,      # kept for compatibility
     save_embedding_to_qdrant,
@@ -18,10 +19,11 @@ from qdrant_utils.qdrant_client import (
     get_model,
     get_qdrant_client,
 )
-from database import get_db
-from schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult
-from services.product_service import ProductService
-
+from api.database import get_db
+from api.schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult,BoundingBox
+from api.services.product_service import ProductService
+from api.services import minio_client
+from api.services.minio_client import put_object, MINIO_BUCKET
 router = APIRouter(
     prefix="/api/products",
     tags=["Products"],
@@ -96,40 +98,49 @@ def create_product(
     # Save images + generate embeddings
     # ------------------------------
     if images:
-        upload_dir = "uploads"
-        os.makedirs(upload_dir, exist_ok=True)
-
         for idx, image in enumerate(images):
             try:
-                # Validate extension
-                ext = image.filename.split('.')[-1].lower()
+                ext = image.filename.split(".")[-1].lower()
                 if ext not in {"png", "jpg", "jpeg", "gif", "webp"}:
-                    print(f"Skipping unsupported file: {image.filename}")
                     continue
 
-                # Store the image
-                filename = f"{uuid.uuid4()}.{ext}"
-                file_path = os.path.join(upload_dir, filename)
+                object_name = f"products/{product.id}/{uuid.uuid4()}.{ext}"
+                image_bytes = image.file.read()
 
-                with open(file_path, "wb") as f:
-                    f.write(image.file.read())
+                # ---- Upload to MinIO ----
+                minio_client.put_object(
+                    bucket_name=MINIO_BUCKET,
+                    object_name=object_name,
+                    data=io.BytesIO(image_bytes),
+                    length=len(image_bytes),
+                    content_type=image.content_type,
+                )
 
-                # Add DB image record
                 is_primary = idx == 0
-                service.add_product_image(product.id, file_path, is_primary)
+                object_key = object_name
 
-                # Save embedding to Qdrant
+                service.add_product_image(
+                    product.id,
+                    object_key,
+                    is_primary
+                )
+
+                # ---- Save embedding ----
                 save_embedding_to_qdrant(
-                    model,
-                    qdrant_client,
+                    model=model,
+                    client=qdrant_client,
                     product_id=product.id,
-                    image_path=file_path,
-                    point_id=str(uuid.uuid4())  # Qdrant expects unsigned int or UUID
+                    image_bytes=image_bytes,
+                    additional_data={
+                        "object_key": object_name,
+                        "is_primary": is_primary
+                    },
+                    point_id=str(uuid.uuid4())
                 )
 
             except Exception as e:
-                print(f"Error uploading image {image.filename}: {str(e)}")
-                continue
+                print(f"❌ Error uploading image {image.filename}: {e}")
+
 
     return product
 
@@ -179,200 +190,106 @@ def list_products(
     service = ProductService(db)
     return service.list_products(skip=skip, limit=limit)
 
+
 @router.post(
-        "/search-by-image",
-        response_model=List[ProductSearchResult],
-    summary="Search products by image using embedding similarity",
-    description="Upload an image, returns top-K similar products from Qdrant with similarity threshold and scores."
+    "/search-by-image",
+    response_model=List[ProductSearchResult],
+    summary="Search products by image"
 )
 async def search_product_by_image(
-    image: UploadFile = File(..., description="Query image file"),
-    k: int = Query(20, ge=1, le=100, description="Number of results to return (top-K)"),
-    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score threshold"),
+    image: UploadFile = File(...),
+    k: int = Query(20, ge=1, le=100),
+    threshold: float = Query(0.0, ge=0.0, le=1.0),
     db: Session = Depends(get_db)
 ):
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    ext = image.filename.split(".")[-1].lower()
-    filename = f"{uuid.uuid4()}.{ext}"
-    file_path = os.path.join(upload_dir, filename)
-
-    # Load YOLO model
-    base_dir = os.path.dirname(__file__) 
-    yolo_model_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
-    yolo_model = YOLO(yolo_model_path)
-
+    # -------- Load image --------
     image_bytes = await image.read()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
     if img is None:
         return []
 
-    results = yolo_model(img)
-    detections = results[0]
+    # -------- YOLO detection --------
+    base_dir = os.path.dirname(__file__)
+    yolo_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
+    yolo_model = YOLO(yolo_path)
+    detections = yolo_model(img)[0]
 
-    # Get embedding model and Qdrant client
-    embedding_model = get_model()
+    # -------- Embedding infra --------
+    model = get_model()
     client = get_qdrant_client()
-    if embedding_model is None or client is None:
-        raise HTTPException(status_code=500, detail="Model or Qdrant client not initialized")
-    
-    # Create a copy of the image to draw bounding boxes on
-    img_with_boxes = img.copy()
-    
-    # Temporary directory for crop images
-    temp_crops_dir = os.path.join(upload_dir, "temp_crops")
-    os.makedirs(temp_crops_dir, exist_ok=True)
-    
+    if model is None or client is None:
+        raise HTTPException(500, "Embedding model or Qdrant not initialized")
+
     service = ProductService(db)
-    all_results = []
-    seen_product_ids = set()
-    
-    try:
-        # Save uploaded image
-        with open(file_path, "wb") as f:
-            f.write(image_bytes)
+    seen = set()
+    results = []
 
-        for i, box in enumerate(detections.boxes):
-            # get xyxy bounding box coordinates
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-            conf = float(box.conf[0]) if hasattr(box, 'conf') and len(box.conf) > 0 else 0.0
+    draw_img = img.copy()  # copy for drawing
 
-            # crop the region from the original image
-            crop = img[y1:y2, x1:x2]
+    for box in detections.boxes:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
 
-            # skip invalid crops
-            if crop.size == 0:
-                continue
+        ok, buf = cv2.imencode(".jpg", crop)
+        if not ok:
+            continue
+        crop_bytes = buf.tobytes()
 
-            # Save crop temporarily
-            crop_filename = f"crop_{i}_{uuid.uuid4()}.jpg"
-            crop_path = os.path.join(temp_crops_dir, crop_filename)
-            cv2.imwrite(crop_path, crop)
-            
-            # Initialize label
-            label = None
-            
-            try:
-                # Search similar products for this crop in Qdrant
-                hits = search_similar(embedding_model, client, crop_path, top_k=k)
-                
-                # Filter by threshold and get the best match
-                filtered_hits = [hit for hit in hits if hit.get("score", 0.0) >= threshold]
-                
-                if filtered_hits:
-                    # Get the best matching product
-                    best_hit = filtered_hits[0]
-                    product_id = best_hit.get("payload", {}).get("product_id")
-                    best_score = best_hit.get("score", 0.0)
-                    
-                    if product_id:
-                        try:
-                            product = service.get_product(product_id)
-                            
-                            # Add to results if not seen before
-                            if product_id not in seen_product_ids:
-                                seen_product_ids.add(product_id)
-                                all_results.append(ProductSearchResult(
-                                    product=product,
-                                    score=best_score,
-                                    similarity_percent=best_score * 100.0
-                                ))
-                            
-                            # Prepare label for bounding box
-                            max_label_length = 25
-                            product_name = product.name
-                            if len(product_name) > max_label_length:
-                                product_name = product_name[:max_label_length-3] + "..."
-                            label = f"{product_name} ({best_score:.2f})"
-                        except HTTPException:
-                            label = None
-                
-            except Exception as e:
-                print(f"Error processing crop {i}: {str(e)}")
-                label = None
-            
-            finally:
-                # Clean up crop file
-                try:
-                    if os.path.exists(crop_path):
-                        os.remove(crop_path)
-                except OSError:
-                    pass
-            
-            # Draw bounding box
-            color = (0, 255, 0)  # Green color in BGR
-            thickness = 2
-            cv2.rectangle(img_with_boxes, (x1, y1), (x2, y2), color, thickness)
-            
-            # Only add label if product was found
-            if label:
-                # Add label with product prediction
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 0.5
-                label_thickness = 1
-                (label_width, label_height), baseline = cv2.getTextSize(label, font, font_scale, label_thickness)
-                
-                # Calculate label position - ensure it doesn't go outside image bounds
-                img_height, img_width = img_with_boxes.shape[:2]
-                label_x = x1
-                label_y = y1 - 5
-                
-                # If label would go above image, place it below the box
-                if label_y - label_height < 0:
-                    label_y = y2 + label_height + 5
-                    # If still outside, place inside box at top
-                    if label_y + label_height > img_height:
-                        label_y = y1 + label_height + 5
-                
-                # Ensure label doesn't go beyond image width
-                if label_x + label_width > img_width:
-                    label_x = img_width - label_width - 5
-                    if label_x < 0:
-                        label_x = 5
-                
-                # Draw background rectangle for text
-                bg_x1 = label_x - 2
-                bg_y1 = label_y - label_height - 2
-                bg_x2 = label_x + label_width + 2
-                bg_y2 = label_y + baseline + 2
-                
-                # Ensure background is within image bounds
-                if bg_y1 < 0:
-                    bg_y1 = 0
-                if bg_y2 > img_height:
-                    bg_y2 = img_height
-                if bg_x1 < 0:
-                    bg_x1 = 0
-                if bg_x2 > img_width:
-                    bg_x2 = img_width
-                
-                cv2.rectangle(img_with_boxes, (bg_x1, bg_y1), (bg_x2, bg_y2), color, -1)
-                
-                # Draw text
-                cv2.putText(img_with_boxes, label, (label_x, label_y), 
-                           font, font_scale, (0, 0, 0), label_thickness)
-        
-        # Display the image with bounding boxes using matplotlib
-        img_with_boxes_rgb = cv2.cvtColor(img_with_boxes, cv2.COLOR_BGR2RGB)
-        plt.figure(figsize=(15, 10))
-        plt.imshow(img_with_boxes_rgb)
-        plt.title(f'Search Image with Product Predictions ({len(detections.boxes)} objects detected)')
-        plt.axis('off')
-        plt.show()
-        
-        # Sort by score descending (highest similarity first)
-        all_results.sort(key=lambda x: x.score, reverse=True)
-        
-        return all_results
-    finally:
-        # Clean up temp file
-        try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-        except OSError:
-            pass
+        # Search in Qdrant
+        hits = search_similar(
+            model=model,
+            client=client,
+            image_bytes=crop_bytes,
+            top_k=k
+        )
+        hits = [h for h in hits if h["score"] >= threshold]
+        if not hits:
+            continue
+
+        best = hits[0]
+        product_id = best["payload"].get("product_id")
+        if not product_id or product_id in seen:
+            continue
+
+        product = service.get_product(product_id)
+        seen.add(product_id)
+
+        score = best["score"]
+        label = f"{product.name} ({score*100:.1f}%)"
+
+        # =========================
+        # DRAW BOUNDING BOX + LABEL
+        # =========================
+        color = (0, 255, 0)
+        thickness = 2
+        cv2.rectangle(draw_img, (x1, y1), (x2, y2), color, thickness)
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        text_y = max(y1 - 10, th + 10)
+        cv2.rectangle(draw_img, (x1, text_y - th - 6), (x1 + tw + 6, text_y), color, -1)
+        cv2.putText(draw_img, label, (x1 + 3, text_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+        # =========================
+        # ADD TO RESPONSE (with bbox)
+        # =========================
+        results.append(ProductSearchResult(
+            product=product,
+            score=score,
+            similarity_percent=score * 100.0,
+            bbox=BoundingBox(x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2))
+        ))
+
+    # Optional: show image locally for debugging
+    # cv2.imshow("Search Results", draw_img)
+    # cv2.waitKey(0)
+    # cv2.destroyAllWindows()
+
+    return results
+
+
 
 
 # ------------------------------
@@ -417,57 +334,57 @@ def delete_product(
         raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
     return None
 
-# ------------------------------
-# Upload Product Image
-# ------------------------------
-@router.post(
-    "/{product_id}/upload-image/",
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload product image"
-)
-def upload_product_image(
-    product_id: int = Path(..., description="The ID of the product to upload image for", example=1),
-    file: UploadFile = File(..., description="Image file to upload"),
-    is_primary: bool = Query(False, description="Set as primary image"),
-    db: Session = Depends(get_db)
-):
-    # Validate file type
-    allowed_extensions = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
-    file_extension = file.filename.split('.')[-1].lower()
+# # ------------------------------
+# # Upload Product Image
+# # ------------------------------
+# @router.post(
+#     "/{product_id}/upload-image/",
+#     status_code=status.HTTP_201_CREATED,
+#     summary="Upload product image"
+# )
+# def upload_product_image(
+#     product_id: int = Path(..., description="The ID of the product to upload image for", example=1),
+#     file: UploadFile = File(..., description="Image file to upload"),
+#     is_primary: bool = Query(False, description="Set as primary image"),
+#     db: Session = Depends(get_db)
+# ):
+#     # Validate file type
+#     allowed_extensions = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+#     file_extension = file.filename.split('.')[-1].lower()
     
-    if file_extension not in allowed_extensions:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid file type. Allowed types: {', '.join(allowed_extensions)}"
-        )
+#     if file_extension not in allowed_extensions:
+#         raise HTTPException(
+#             status_code=status.HTTP_400_BAD_REQUEST,
+#             detail=f"Invalid file type. Allowed types: {', '.join(allowed_extensions)}"
+#         )
     
-    # Create upload directory
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
+#     # Create upload directory
+#     upload_dir = "uploads"
+#     os.makedirs(upload_dir, exist_ok=True)
     
-    # Generate unique filename
-    file_name = f"{uuid.uuid4()}.{file_extension}"
-    file_path = os.path.join(upload_dir, file_name)
+#     # Generate unique filename
+#     file_name = f"{uuid.uuid4()}.{file_extension}"
+#     file_path = os.path.join(upload_dir, file_name)
     
-    try:
-        # Save file synchronously
-        with open(file_path, "wb") as buffer:
-            buffer.write(file.file.read())
+#     try:
+#         # Save file synchronously
+#         with open(file_path, "wb") as buffer:
+#             buffer.write(file.file.read())
         
-        # Save file info to DB if needed
-        service = ProductService(db)
-        service.add_product_image(product_id, file_path, is_primary)
+#         # Save file info to DB if needed
+#         service = ProductService(db)
+#         service.add_product_image(product_id, file_path, is_primary)
         
-        return {
-            "status": "success",
-            "message": "Image uploaded successfully",
-            "file_path": file_path,
-            "is_primary": is_primary
-        }
-    except Exception as e:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error uploading file: {str(e)}"
-        )
+#         return {
+#             "status": "success",
+#             "message": "Image uploaded successfully",
+#             "file_path": file_path,
+#             "is_primary": is_primary
+#         }
+#     except Exception as e:
+#         if os.path.exists(file_path):
+#             os.remove(file_path)
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail=f"Error uploading file: {str(e)}"
+#         )

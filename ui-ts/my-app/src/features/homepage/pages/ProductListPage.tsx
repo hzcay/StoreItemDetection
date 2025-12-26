@@ -51,7 +51,15 @@ export function ProductListPage() {
                         onTextSearch={(text) => setSearchTerm(text)}
                         onImageUpload={(file) => {
                             console.log("Uploaded image:", file);
-                            // TODO: call image search API here
+                            // Convert the file to base64 and store it in sessionStorage
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                const base64String = reader.result as string;
+                                sessionStorage.setItem('uploadedImage', base64String);
+                                // Navigate to the image search page
+                                window.location.href = '/products-image-search';
+                            };
+                            reader.readAsDataURL(file);
                         }}
                     />
                 </div>

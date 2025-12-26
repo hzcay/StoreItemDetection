@@ -3,14 +3,15 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 import os
 import uuid
-
-from models import Product as ProductModel, ProductImage as ProductImageModel
-from schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductImageCreate, ProductImageResponse
-from repositories.product_repository import ProductRepository
+from api.services.minio_client import minio_client, MINIO_BUCKET
+from api.models.models import Product as ProductModel, ProductImage as ProductImageModel
+from api.schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductImageCreate, ProductImageResponse
+from api.repositories.product_repository import ProductRepository
 from ultralytics import YOLO
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from api.services.minio_client import generate_presigned_url
 class ProductService:
     def __init__(self, db: Session):
         self.db = db
@@ -78,22 +79,75 @@ class ProductService:
 
     def get_product(self, product_id: int) -> ProductResponse:
         """
-        Get a product by ID with proper error handling
+        Get a product by ID with proper error handling and eager loading of images
         """
+        # Get the product with eager loading of images
         db_product = self.product_repo.get_product_by_id(product_id)
         if not db_product:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Product with ID {product_id} not found"
             )
-        return ProductResponse.model_validate(db_product.__dict__)
+        
+        # Convert images to proper format with presigned URLs
+        images = []
+        if hasattr(db_product, 'images') and db_product.images:
+            images = [
+                {
+                    'id': img.id,
+                    'image_url': generate_presigned_url(img.image_url),
+                    'alt_text': img.alt_text,
+                    'is_primary': img.is_primary,
+                    'created_at': img.created_at
+                }
+                for img in db_product.images
+            ]
+        
+        # Create response with all product data
+        product_data = {
+            **db_product.__dict__,
+            'images': images
+        }
+        
+        # Handle category if it's a relationship
+        if hasattr(db_product, 'category') and db_product.category:
+            product_data['category'] = db_product.category
+        
+        return ProductResponse.model_validate(product_data)
 
     def list_products(self, skip: int = 0, limit: int = 100) -> List[ProductResponse]:
-        """
-        List products with pagination
-        """
         db_products = self.product_repo.get_products(skip=skip, limit=limit)
-        return [ProductResponse.model_validate(p.__dict__) for p in db_products]
+        results = []
+
+        for product in db_products:
+            images = []
+
+            for img in product.images:
+                images.append(ProductImageResponse(
+                    id=img.id,
+                    image_url=generate_presigned_url(img.image_url),
+                    alt_text=img.alt_text,
+                    is_primary=img.is_primary,
+                    created_at=img.created_at
+                ))
+
+            results.append(ProductResponse(
+                id=product.id,
+                name=product.name,
+                description=product.description,
+                price=product.price,
+                stock_quantity=product.stock_quantity,
+                sku=product.sku,
+                barcode=product.barcode,
+                is_active=product.is_active,
+                category=product.category,
+                images=images,
+                created_at=product.created_at,
+                updated_at=product.updated_at
+            ))
+
+        return results
+
 
     def update_product(self, product_id: int, product_update: ProductUpdate) -> ProductResponse:
         """
@@ -129,7 +183,7 @@ class ProductService:
             )
         return success
 
-    def add_product_image(self, product_id: int, image_url: str, is_primary: bool = False) -> ProductImageResponse:
+    def add_product_image(self, product_id: int, object_key: str, is_primary: bool = False) -> ProductImageResponse:
         """
         Add an image to a product
         """
@@ -152,7 +206,7 @@ class ProductService:
         # Add new image
         db_image = ProductImageModel(
             product_id=product_id,
-            image_url=image_url,
+            image_url=object_key,
             is_primary=is_primary
         )
         self.db.add(db_image)
@@ -184,12 +238,10 @@ class ProductService:
                 detail=f"Image with ID {image_id} not found"
             )
         
-        # Delete the image file
-        try:
-            if os.path.exists(db_image.image_url):
-                os.remove(db_image.image_url)
-        except Exception as e:
-            print(f"Error deleting image file: {str(e)}")
+        minio_client.remove_object(
+            MINIO_BUCKET,
+            db_image.image_url
+        )
         
         # Delete the database record
         self.db.delete(db_image)
