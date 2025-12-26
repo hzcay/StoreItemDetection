@@ -9,6 +9,7 @@ const navItems = [
     { name: "Products", path: "/products" },
     { name: "Categories", path: "/categories" },
     { name: "Orders", path: "/orders" },
+    { name: "Display", path: "/home" },
 ];
 
 export function Sidebar() {

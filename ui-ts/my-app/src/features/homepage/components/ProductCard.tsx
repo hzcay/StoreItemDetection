@@ -9,14 +9,7 @@ interface ProductCardProps {
 
 export function ProductCard({ product }: ProductCardProps) {
     const primaryImage = product.images?.[0];
-    const getImageUrl = (path: string) => {
-        if (!path) return null;
-        const cleanPath = path.startsWith('/') ? path.slice(1) : path;
-        return `http://localhost:8000/${cleanPath}`;
-    };
-    console.log(primaryImage?.image_url)
-    const imageUrl = getImageUrl(primaryImage?.image_url);
-    console.log(imageUrl)
+    const imageUrl = primaryImage?.image_url;
 
     return (
         <Card className="w-full max-w-sm overflow-hidden transition-transform hover:shadow-lg hover:-translate-y-1">

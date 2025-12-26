@@ -1,9 +1,9 @@
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from datetime import datetime
 
-from models import Product as ProductModel, ProductImage as ProductImageModel
-from schemas.schema import ProductCreate, ProductImageCreate
+from api.models.models import Product as ProductModel, ProductImage as ProductImageModel
+from api.schemas.schema import ProductCreate, ProductImageCreate
 
 class ProductRepository:
     def __init__(self, db: Session):
@@ -18,16 +18,28 @@ class ProductRepository:
         return db_product
 
     def get_product_by_id(self, product_id: int) -> Optional[ProductModel]:
-        """Get a product by ID"""
-        return self.db.query(ProductModel).filter(ProductModel.id == product_id).first()
+        """Get a product by ID with eager loading of images"""
+        return (
+            self.db.query(ProductModel)
+            .options(joinedload(ProductModel.images))
+            .filter(ProductModel.id == product_id)
+            .first()
+        )
 
     def get_product_by_sku(self, sku: str) -> Optional[ProductModel]:
         """Get a product by SKU"""
         return self.db.query(ProductModel).filter(ProductModel.sku == sku).first()
 
+    # api/repositories/product_repository.py
     def get_products(self, skip: int = 0, limit: int = 100) -> List[ProductModel]:
-        """Get list of products with pagination"""
-        return self.db.query(ProductModel).offset(skip).limit(limit).all()
+        """Get list of products with pagination and their images"""
+        return (
+            self.db.query(ProductModel)
+            .options(joinedload(ProductModel.images))  # Eager load images
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
 
     def update_product(self, product_id: int, product_update: dict) -> Optional[ProductModel]:
         """Update a product"""

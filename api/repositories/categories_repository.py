@@ -2,8 +2,8 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from datetime import datetime
 
-from models import Category as CategoryModel
-from schemas.schema import CategoryCreate
+from api.models.models import Category as CategoryModel
+from api.schemas.schema import CategoryCreate
 
 class CategoriesRepository:
     def __init__(self, db: Session):

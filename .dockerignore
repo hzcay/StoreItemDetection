@@ -1,0 +1,45 @@
+# Version control
+.git/
+.github/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+
+# Environment variables (except .env)
+.env.*
+!.env
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/
+
+# Local development
+.docker/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build files
+dist/
+build/
+*.egg-info/
+
+# Allow only these
+!api/
+!models/
+!Dockerfile
+!.dockerignore

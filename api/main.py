@@ -11,13 +11,13 @@ from datetime import datetime
 import sys
 from pathlib import Path
 
-from database import engine, get_db
-from models import Base
+from api.database import engine, get_db
+from api.models import Base
 
 # Import routers
-from controllers.product_controller import router as product_router
-from controllers.categories_controller import router as categories_router
-from qdrant_utils.qdrant_client import initialize_model, create_qdrant_client
+from api.controllers.product_controller import router as product_router
+from api.controllers.categories_controller import router as categories_router
+from api.qdrant_utils.qdrant_client import initialize_model, create_qdrant_client
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -134,4 +134,4 @@ async def test_db_connection(db: Session = Depends(get_db)):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)     
+    uvicorn.run("api.main:app", host="0.0.0.0", port=8000, reload=True)
