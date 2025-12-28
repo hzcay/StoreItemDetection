@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from datetime import datetime
 import sys
+import os
 from pathlib import Path
 
 from api.database import engine, get_db
@@ -18,6 +19,7 @@ from api.models import Base
 from api.controllers.product_controller import router as product_router
 from api.controllers.categories_controller import router as categories_router
 from api.qdrant_utils.qdrant_client import initialize_model, create_qdrant_client
+from api.services.minio_client import init_minio
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -60,9 +62,16 @@ def custom_openapi():
 app.openapi = custom_openapi
 
 # CORS middleware configuration 
+# Note: When allow_credentials=True, cannot use wildcard '*' for allow_origins
+# Get allowed origins from environment or use defaults
+cors_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -71,6 +80,25 @@ app.add_middleware(
 # Include routers
 app.include_router(product_router, tags=["Products"])
 app.include_router(categories_router, tags=["Categories"])
+
+# Startup event: Initialize services
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on application startup."""
+    try:
+        # Initialize MinIO bucket
+        init_minio()
+        print("✅ MinIO bucket initialized successfully")
+        
+        # Initialize Qdrant client
+        create_qdrant_client()
+        print("✅ Qdrant client initialized successfully")
+        
+        # Initialize model
+        initialize_model()
+        print("✅ Model initialized successfully")
+    except Exception as e:
+        print(f"⚠️  Warning during startup: {e}")
 
 # Health check endpoint
 @app.get(

@@ -62,11 +62,25 @@ def get_model():
     use_color_embedding = checkpoint.get('use_color_embedding', False)
     color_embedding_size = checkpoint.get('color_embedding_size', 64)
     
-    # Auto-detect color_encoder from checkpoint
+    # Auto-detect color_encoder from checkpoint state_dict
     state_dict = checkpoint.get('model_state_dict', {})
-    if not use_color_embedding and any('color_encoder' in k for k in state_dict.keys()):
+    # Kiểm tra nhiều patterns để detect color encoder
+    color_encoder_keys = [
+        k for k in state_dict.keys() 
+        if 'color_encoder' in k.lower() or 'colorencoder' in k.lower()
+    ]
+    
+    if color_encoder_keys:
         use_color_embedding = True
-        print("Auto-detected color_encoder in checkpoint, enabling color embedding")
+        print(f"✅ Auto-detected color_encoder in checkpoint ({len(color_encoder_keys)} keys), enabling color embedding")
+    elif use_color_embedding:
+        print(f"✅ Using color_embedding from checkpoint config")
+    else:
+        # Late Fusion requires color_embedding, but checkpoint doesn't have it
+        print(f"⚠️  WARNING: No color_encoder detected in checkpoint!")
+        print(f"   Late Fusion requires color_embedding. Please retrain with --use-color-embedding flag.")
+        print(f"   Attempting to enable color_embedding anyway (may not match pretrained weights)...")
+        use_color_embedding = True  # Force enable for Late Fusion
     
     inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
     model = ResMobileNetV2(
@@ -79,6 +93,15 @@ def get_model():
     
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     
+    # Verify color_encoder was loaded correctly
+    if use_color_embedding and model.color_encoder is None:
+        print("⚠️  WARNING: use_color_embedding=True but model.color_encoder is None!")
+        print("   This may cause errors in Late Fusion. Re-initializing color_encoder...")
+        from models.backbone.ResMobileNetV2 import HSVColorEncoder
+        model.color_encoder = HSVColorEncoder(embedding_size=color_embedding_size)
+        model.color_encoder.to(DEVICE)
+        model.color_encoder.eval()
+    
     # Load color_alpha if exists (from training config)
     if use_color_embedding and 'color_alpha' in checkpoint:
         model.color_alpha = checkpoint.get('color_alpha', 0.3)
@@ -86,7 +109,9 @@ def get_model():
     model.to(DEVICE)
     model.eval()
     
-    print(f"Model initialized successfully (use_color_embedding={use_color_embedding})")
+    # Final check
+    has_color = model.color_encoder is not None
+    print(f"✅ Model initialized successfully (color_encoder={'enabled' if has_color else 'disabled'})")
 
     _MODEL_CACHE = model
     return _MODEL_CACHE
@@ -141,15 +166,14 @@ def get_image_embedding(
     img_tensor = transform(img).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
+        # Model ở eval mode luôn trả về (visual_emb, color_emb)
+        visual_emb, color_emb = model(img_tensor)
+        
+        visual_emb = visual_emb.squeeze()
+        visual_emb = F.normalize(visual_emb, p=2, dim=0)
+        visual_emb = visual_emb.cpu().numpy().astype(np.float32)
+        
         if return_color:
-            visual_emb, color_emb = model(img_tensor, return_color=True)
-
-            # ---- Visual embedding ----
-            visual_emb = visual_emb.squeeze()
-            visual_emb = F.normalize(visual_emb, p=2, dim=0)
-            visual_emb = visual_emb.cpu().numpy().astype(np.float32)
-
-            # ---- Color embedding ----
             if color_emb is not None:
                 color_emb = color_emb.squeeze()
                 color_emb = F.normalize(color_emb, p=2, dim=0)
@@ -160,9 +184,6 @@ def get_image_embedding(
             return visual_emb, color_emb
 
         else:
-            visual_emb = model(img_tensor).squeeze()
-            visual_emb = F.normalize(visual_emb, p=2, dim=0)
-            visual_emb = visual_emb.cpu().numpy().astype(np.float32)
             return visual_emb
 
 def search_similar(
@@ -170,8 +191,8 @@ def search_similar(
     client: QdrantClient,
     image_bytes: bytes,     # 🔒 BYTES ONLY
     top_k: int = 20,
-    visual_weight: float = 0.6,
-    color_weight: float = 0.4
+    visual_weight: float = 0.7,  # Giảm từ 0.8 xuống 0.6 để linh hoạt hơn
+    color_weight: float = 0.3     # Tăng từ 0.2 lên 0.4 vì color match tốt hơn
 ):
     if client is None:
         raise RuntimeError("Qdrant client not initialized")
@@ -207,18 +228,14 @@ def search_similar(
 
     # Extract embeddings
     try:
-        if not getattr(model, "use_color_embedding", False):
-            raise RuntimeError("Model must support color embedding")
-
-        query_visual, query_color = get_image_embedding(
-            image_bytes=image_bytes,
-            model=model,
-            return_color=True
-        )
-
+        # Check if model has color_encoder (not use_color_embedding attribute)
+        has_color = model.color_encoder is not None
+        if not has_color:
+            raise RuntimeError("Model must have color_encoder for Late Fusion. Please ensure checkpoint was trained with --use-color-embedding")
+        
+        query_visual, query_color = get_image_embedding(image_bytes, model, return_color=True)
         if query_color is None:
-            raise RuntimeError("Color embedding missing")
-
+            raise RuntimeError("Failed to extract color embedding from model")
     except Exception as e:
         print(f"❌ Embedding error: {e}")
         return []
@@ -280,17 +297,18 @@ def save_embedding_to_qdrant(
         # ---- Ensure collection exists ----
         collections = client.get_collections()
         collection_names = [c.name for c in collections.collections]
-
-        # ---- Extract embeddings (Late Fusion) ----
-        visual_emb, color_emb = get_image_embedding(
-            image_bytes=image_bytes,
-            model=model,
-            return_color=True
-        )
-
+        
+        # Check if model has color_encoder
+        if model.color_encoder is None:
+            raise RuntimeError("Model must have color_encoder for Late Fusion. Please ensure checkpoint was trained with --use-color-embedding")
+        
+        # Extract embeddings separately for Late Fusion
+        visual_emb, color_emb = get_image_embedding(image_bytes, model, return_color=True)
+        
         if color_emb is None:
-            raise RuntimeError("Model must have color embedding for Late Fusion")
-
+            raise RuntimeError("Failed to extract color embedding from model")
+        
+        # Create collection if needed with named vectors
         if QDRANT_COLLECTION not in collection_names:
             client.create_collection(
                 collection_name=QDRANT_COLLECTION,

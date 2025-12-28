@@ -27,8 +27,9 @@ services:
   # Qdrant Vector Database
   # =========================
   qdrant:
-    image: qdrant/qdrant
+    image: qdrant/qdrant:latest
     container_name: qdrant_db
+    restart: unless-stopped
     environment:
       QDRANT__SERVICE__API_KEY: hahathgvinhngu
     volumes:

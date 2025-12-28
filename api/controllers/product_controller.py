@@ -20,10 +20,48 @@ from api.qdrant_utils.qdrant_client import (
     get_qdrant_client,
 )
 from api.database import get_db
-from api.schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult,BoundingBox
+from api.schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult
 from api.services.product_service import ProductService
-from api.services import minio_client
-from api.services.minio_client import put_object, MINIO_BUCKET
+from api.services.minio_client import minio_client, MINIO_BUCKET
+
+# Cache YOLO model để không load lại mỗi request
+_YOLO_MODEL_CACHE = None
+
+def get_yolo_model():
+    """Get YOLO model với caching - ưu tiên custom model đã train"""
+    global _YOLO_MODEL_CACHE
+    if _YOLO_MODEL_CACHE is not None:
+        return _YOLO_MODEL_CACHE
+    
+    # Ưu tiên dùng custom model đã train trước
+    try:
+        base_dir = os.path.dirname(__file__) 
+        yolo_model_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
+        if os.path.exists(yolo_model_path):
+            _YOLO_MODEL_CACHE = YOLO(yolo_model_path)
+            print(f"✅ Using custom YOLO model: {yolo_model_path} (cached)")
+            return _YOLO_MODEL_CACHE
+    except Exception as e:
+        print(f"⚠️  Custom model not found, trying pretrained: {e}")
+    
+    # Fallback về pretrained models nếu không có custom
+    model_options = [
+        'yolo11x.pt',  # YOLOv11 xlarge - fallback
+        'yolo11l.pt',  # YOLOv11 large - fallback
+        'yolo8x.pt',   # YOLOv8 xlarge - fallback
+        'yolo8l.pt',   # YOLOv8 large - fallback
+    ]
+    
+    for model_name in model_options:
+        try:
+            _YOLO_MODEL_CACHE = YOLO(model_name)
+            print(f"✅ Using {model_name} pretrained model (cached)")
+            return _YOLO_MODEL_CACHE
+        except Exception as e:
+            continue
+    
+    raise HTTPException(status_code=500, detail="No YOLO model available. Please ensure custom model exists or ultralytics can download pretrained models.")
+
 router = APIRouter(
     prefix="/api/products",
     tags=["Products"],
@@ -197,23 +235,28 @@ def list_products(
     summary="Search products by image"
 )
 async def search_product_by_image(
-    image: UploadFile = File(...),
-    k: int = Query(20, ge=1, le=100),
-    threshold: float = Query(0.0, ge=0.0, le=1.0),
+    image: UploadFile = File(..., description="Query image file"),
+    k: int = Query(20, ge=1, le=100, description="Number of results to return (top-K)"),
+    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score threshold"),
+    visual_weight: float = Query(0.6, ge=0.0, le=1.0, description="Weight for visual similarity (default: 0.8)"),
+    color_weight: float = Query(0.4, ge=0.0, le=1.0, description="Weight for color similarity (default: 0.2)"),
     db: Session = Depends(get_db)
 ):
-    # -------- Load image --------
+    # Load YOLO model (cached) - ưu tiên custom model đã train
+    yolo_model = get_yolo_model()
+
+    # Read image bytes
     image_bytes = await image.read()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return []
 
-    # -------- YOLO detection --------
-    base_dir = os.path.dirname(__file__)
-    yolo_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
-    yolo_model = YOLO(yolo_path)
-    detections = yolo_model(img)[0]
+    # Run detection với confidence threshold và NMS tốt hơn
+    # conf=0.25: chỉ lấy detections có confidence >= 25%
+    # iou=0.45: IoU threshold cho NMS (Non-Maximum Suppression)
+    results = yolo_model(img, conf=0.25, iou=0.45, verbose=False)
+    detections = results[0]
 
     # -------- Embedding infra --------
     model = get_model()
@@ -222,74 +265,72 @@ async def search_product_by_image(
         raise HTTPException(500, "Embedding model or Qdrant not initialized")
 
     service = ProductService(db)
-    seen = set()
-    results = []
+    seen_product_ids = set()
+    all_results = []
 
-    draw_img = img.copy()  # copy for drawing
-
-    for box in detections.boxes:
+    # Process each detected object
+    for i, box in enumerate(detections.boxes):
         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
         crop = img[y1:y2, x1:x2]
         if crop.size == 0:
             continue
 
-        ok, buf = cv2.imencode(".jpg", crop)
-        if not ok:
-            continue
-        crop_bytes = buf.tobytes()
-
-        # Search in Qdrant
-        hits = search_similar(
-            model=model,
-            client=client,
-            image_bytes=crop_bytes,
-            top_k=k
-        )
-        hits = [h for h in hits if h["score"] >= threshold]
-        if not hits:
+        # Convert crop to bytes (JPEG format)
+        try:
+            _, crop_encoded = cv2.imencode('.jpg', crop)
+            crop_bytes = crop_encoded.tobytes()
+        except Exception as e:
+            print(f"Error encoding crop {i}: {e}")
             continue
 
-        best = hits[0]
-        product_id = best["payload"].get("product_id")
-        if not product_id or product_id in seen:
+        # Search similar products for this crop in Qdrant
+        try:
+            hits = search_similar(
+                model=model,
+                client=client,
+                image_bytes=crop_bytes,
+                top_k=k,
+                visual_weight=visual_weight,
+                color_weight=color_weight
+            )
+            
+            # Filter by threshold and get the best match
+            filtered_hits = [hit for hit in hits if hit.get("score", 0.0) >= threshold]
+            
+            if filtered_hits:
+                # Get the best matching product
+                best_hit = filtered_hits[0]
+                product_id = best_hit.get("payload", {}).get("product_id")
+                best_score = best_hit.get("score", 0.0)
+                visual_score = best_hit.get("visual_score", 0.0)
+                color_score = best_hit.get("color_score", 0.0)
+                
+                if product_id:
+                    try:
+                        product = service.get_product(product_id)
+                        
+                        # Add to results if not seen before
+                        if product_id not in seen_product_ids:
+                            seen_product_ids.add(product_id)
+                            all_results.append(ProductSearchResult(
+                                product=product,
+                                score=best_score,
+                                similarity_percent=best_score * 100.0,
+                                bbox={"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
+                                visual_score=visual_score,
+                                color_score=color_score
+                            ))
+                    except HTTPException:
+                        pass
+        
+        except Exception as e:
+            print(f"Error processing crop {i}: {str(e)}")
             continue
 
-        product = service.get_product(product_id)
-        seen.add(product_id)
-
-        score = best["score"]
-        label = f"{product.name} ({score*100:.1f}%)"
-
-        # =========================
-        # DRAW BOUNDING BOX + LABEL
-        # =========================
-        color = (0, 255, 0)
-        thickness = 2
-        cv2.rectangle(draw_img, (x1, y1), (x2, y2), color, thickness)
-
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        text_y = max(y1 - 10, th + 10)
-        cv2.rectangle(draw_img, (x1, text_y - th - 6), (x1 + tw + 6, text_y), color, -1)
-        cv2.putText(draw_img, label, (x1 + 3, text_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-        # =========================
-        # ADD TO RESPONSE (with bbox)
-        # =========================
-        results.append(ProductSearchResult(
-            product=product,
-            score=score,
-            similarity_percent=score * 100.0,
-            bbox=BoundingBox(x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2))
-        ))
-
-    # Optional: show image locally for debugging
-    # cv2.imshow("Search Results", draw_img)
-    # cv2.waitKey(0)
-    # cv2.destroyAllWindows()
-
-    return results
-
-
+    # Sort by score descending (highest similarity first)
+    all_results.sort(key=lambda x: x.score, reverse=True)
+    
+    return all_results
 
 
 # ------------------------------
@@ -316,9 +357,6 @@ def update_product(
         raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
     return updated_product
 
-# ------------------------------
-# Delete Product
-# ------------------------------
 @router.delete(
     "/{product_id}",
     status_code=status.HTTP_204_NO_CONTENT,
