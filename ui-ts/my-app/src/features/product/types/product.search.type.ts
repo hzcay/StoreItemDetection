@@ -43,5 +43,13 @@ export interface SearchResult {
   product: Product;
   score: number;
   similarity_percent: number;
-  bbox: BoundingBox;  // Added bbox field
+  bbox: BoundingBox | null;  // Added bbox field
+  visual_score: number;
+  color_score: number;
+}
+
+export interface SearchResponse {
+  results: SearchResult[];  // Exact matches (score >= threshold)
+  suggested_products: SearchResult[];  // Suggested products (top-K, may include < threshold)
+  has_exact_match: boolean;
 }

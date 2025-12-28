@@ -2,15 +2,15 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { SearchResult } from "@/features/product/types/product.search.type";
+import { SearchResult, SearchResponse } from "@/features/product/types/product.search.type";
 import { searchProductsByImage } from "@/features/product/services/product.image.api";
 import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowRight, Search, Tag, AlertCircle } from "lucide-react";
+import { ArrowRight, Search, Tag, AlertCircle, Sparkles } from "lucide-react";
 
 export function ProductImageSearch() {
     const [uploadedImage, setUploadedImage] = useState<string | null>(null);
-    const [results, setResults] = useState<SearchResult[]>([]);
+    const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -34,10 +34,11 @@ export function ProductImageSearch() {
                 const blob = await response.blob();
                 const file = new File([blob], 'uploaded-image.jpg', { type: 'image/jpeg' });
 
-                const searchResults = await searchProductsByImage(file);
-                setResults(searchResults);
+                const searchResponse = await searchProductsByImage(file);
+                setSearchResponse(searchResponse);
 
-                setTimeout(() => drawBoundingBoxes(imageData, searchResults), 150);
+                // Draw bounding boxes for exact matches only
+                setTimeout(() => drawBoundingBoxes(imageData, searchResponse.results), 150);
             } catch (err) {
                 console.error('Error searching by image:', err);
                 setError('Không thể kết nối đến máy chủ phân tích hình ảnh.');
@@ -133,7 +134,15 @@ export function ProductImageSearch() {
             <header className="mb-8 flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
                     <h1 className="text-3xl font-bold tracking-tight mb-1">Kết quả tìm kiếm</h1>
-                    <p className="text-sm text-muted-foreground">Phát hiện {results.length} sản phẩm tương đồng.</p>
+                    {searchResponse?.has_exact_match ? (
+                        <p className="text-sm text-muted-foreground">
+                            Tìm thấy {searchResponse.results.length} sản phẩm khớp.
+                        </p>
+                    ) : (
+                        <p className="text-sm text-muted-foreground">
+                            Không tìm thấy sản phẩm khớp. Dưới đây là các gợi ý tương tự.
+                        </p>
+                    )}
                 </div>
                 <Button size="sm" variant="ghost" onClick={() => navigate(-1)}>Tải ảnh khác</Button>
             </header>
@@ -153,49 +162,102 @@ export function ProductImageSearch() {
                 </div>
 
                 {/* DANH SÁCH BÊN PHẢI */}
-                <div className="lg:col-span-4 space-y-4">
-                    <div className="flex items-center gap-2 mb-4 text-sm font-semibold text-slate-500 uppercase tracking-wider">
-                        <Tag className="w-4 h-4" />
-                        Danh sách sản phẩm
-                    </div>
-
-                    <div className="flex flex-col gap-3 max-h-[75vh] overflow-y-auto pr-2 custom-scrollbar">
-                        {results.map((result, index) => (
-                            <Card key={index} className="hover:shadow-md transition-shadow duration-200 border-slate-100 shadow-sm">
-                                <CardContent className="p-4">
-                                    <div className="flex gap-4">
-                                        <div className="flex-shrink-0 w-10 h-10 rounded-full bg-green-500 text-white flex items-center justify-center font-bold text-sm shadow-sm">
-                                            {index + 1}
-                                        </div>
-
-                                        <div className="flex-grow min-w-0">
-                                            <div className="flex justify-between items-start mb-1 gap-2">
-                                                <h4 className="font-semibold text-base truncate leading-tight">
-                                                    {result.product.name}
-                                                </h4>
-                                                <Badge variant="outline" className="text-green-600 border-green-200 bg-green-50 shrink-0 text-[10px] h-5">
-                                                    {result.similarity_percent.toFixed(1)}%
-                                                </Badge>
+                <div className="lg:col-span-4 space-y-6">
+                    {/* Exact Matches */}
+                    {searchResponse && searchResponse.results.length > 0 && (
+                        <div>
+                            <div className="flex items-center gap-2 mb-4 text-sm font-semibold text-slate-500 uppercase tracking-wider">
+                                <Tag className="w-4 h-4" />
+                                Sản phẩm tìm thấy ({searchResponse.results.length})
+                            </div>
+                            <div className="flex flex-col gap-3 max-h-[40vh] overflow-y-auto pr-2 custom-scrollbar">
+                                {searchResponse.results.map((result, index) => (
+                                    <Card key={`exact-${result.product.id}`} className="hover:shadow-md transition-shadow duration-200 border-green-200 shadow-sm">
+                                        <CardContent className="p-4">
+                                            <div className="flex gap-4">
+                                                <div className="flex-shrink-0 w-10 h-10 rounded-full bg-green-500 text-white flex items-center justify-center font-bold text-sm shadow-sm">
+                                                    {index + 1}
+                                                </div>
+                                                <div className="flex-grow min-w-0">
+                                                    <div className="flex justify-between items-start mb-1 gap-2">
+                                                        <h4 className="font-semibold text-base truncate leading-tight">
+                                                            {result.product.name}
+                                                        </h4>
+                                                        <Badge variant="outline" className="text-green-600 border-green-200 bg-green-50 shrink-0 text-[10px] h-5">
+                                                            {result.similarity_percent.toFixed(1)}%
+                                                        </Badge>
+                                                    </div>
+                                                    <p className="text-[10px] text-muted-foreground mb-3 font-mono">
+                                                        ID: {result.product.id}
+                                                    </p>
+                                                    <Button
+                                                        size="sm"
+                                                        className="w-full bg-slate-900 hover:bg-green-600 text-white text-xs h-8"
+                                                        onClick={() => window.location.href = `http://localhost:5173/products/${result.product.id}`}
+                                                    >
+                                                        Xem chi tiết
+                                                        <ArrowRight className="ml-2 w-3 h-3" />
+                                                    </Button>
+                                                </div>
                                             </div>
+                                        </CardContent>
+                                    </Card>
+                                ))}
+                            </div>
+                        </div>
+                    )}
 
-                                            <p className="text-[10px] text-muted-foreground mb-3 font-mono">
-                                                ID: {result.product.id}
-                                            </p>
+                    {/* Suggested Products */}
+                    {searchResponse && searchResponse.suggested_products.length > 0 && (
+                        <div>
+                            <div className="flex items-center gap-2 mb-4 text-sm font-semibold text-slate-500 uppercase tracking-wider">
+                                <Sparkles className="w-4 h-4" />
+                                Sản phẩm tương tự ({searchResponse.suggested_products.length})
+                            </div>
+                            <div className="flex flex-col gap-3 max-h-[40vh] overflow-y-auto pr-2 custom-scrollbar">
+                                {searchResponse.suggested_products.map((result, index) => (
+                                    <Card key={`suggested-${result.product.id}`} className="hover:shadow-md transition-shadow duration-200 border-slate-200 shadow-sm">
+                                        <CardContent className="p-4">
+                                            <div className="flex gap-4">
+                                                <div className="flex-shrink-0 w-10 h-10 rounded-full bg-slate-400 text-white flex items-center justify-center font-bold text-sm shadow-sm">
+                                                    {index + 1}
+                                                </div>
+                                                <div className="flex-grow min-w-0">
+                                                    <div className="flex justify-between items-start mb-1 gap-2">
+                                                        <h4 className="font-semibold text-base truncate leading-tight">
+                                                            {result.product.name}
+                                                        </h4>
+                                                        <Badge variant="outline" className="text-slate-600 border-slate-200 bg-slate-50 shrink-0 text-[10px] h-5">
+                                                            {result.similarity_percent.toFixed(1)}%
+                                                        </Badge>
+                                                    </div>
+                                                    <p className="text-[10px] text-muted-foreground mb-3 font-mono">
+                                                        ID: {result.product.id}
+                                                    </p>
+                                                    <Button
+                                                        size="sm"
+                                                        className="w-full bg-slate-700 hover:bg-slate-600 text-white text-xs h-8"
+                                                        onClick={() => window.location.href = `http://localhost:5173/products/${result.product.id}`}
+                                                    >
+                                                        Xem chi tiết
+                                                        <ArrowRight className="ml-2 w-3 h-3" />
+                                                    </Button>
+                                                </div>
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                ))}
+                            </div>
+                        </div>
+                    )}
 
-                                            <Button
-                                                size="sm"
-                                                className="w-full bg-slate-900 hover:bg-green-600 text-white text-xs h-8"
-                                                onClick={() => window.location.href = `http://localhost:5173/products/${result.product.id}`}
-                                            >
-                                                Xem chi tiết
-                                                <ArrowRight className="ml-2 w-3 h-3" />
-                                            </Button>
-                                        </div>
-                                    </div>
-                                </CardContent>
-                            </Card>
-                        ))}
-                    </div>
+                    {/* No Results Message */}
+                    {searchResponse && !searchResponse.has_exact_match && searchResponse.suggested_products.length === 0 && (
+                        <div className="text-center py-8 text-muted-foreground">
+                            <AlertCircle className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                            <p>Không tìm thấy sản phẩm nào.</p>
+                        </div>
+                    )}
                 </div>
             </div>
         </div>
