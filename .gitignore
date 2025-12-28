@@ -212,3 +212,7 @@ data/raw.rar
 data/raw/
 data/processing/
 uploads/
+
+# YOLO model files (too large for GitHub)
+*.pt
+yolo*.pt

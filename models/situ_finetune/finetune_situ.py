@@ -15,29 +15,32 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
-from collections import Counter
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
+from torch.utils.data import Subset, WeightedRandomSampler
+from collections import Counter
+
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
 from models.losses.supcon_loss import SupConLoss
 class SituDataset(Dataset):
-    def __init__(self, data_dir: str, transform=None):
+    def __init__(self, data_dir: str, transform_visual=None, transform_color=None, is_train=True):
         self.data_dir = Path(data_dir)
-        self.transform = transform
+        # [FIX] Nhận đúng tham số transform
+        self.transform_visual = transform_visual
+        self.transform_color = transform_color
+        self.is_train = is_train
         self.samples = []
         
+        # Logic load ảnh Situ (Giữ nguyên)
         for class_dir in sorted(self.data_dir.iterdir()):
-            if not class_dir.is_dir():
-                continue
-            
+            if not class_dir.is_dir(): continue
             try:
                 class_id = int(class_dir.name)
-            except ValueError:
-                continue
+            except ValueError: continue
             
             video_dir = class_dir / "video"
             if video_dir.exists():
@@ -45,7 +48,7 @@ class SituDataset(Dataset):
                     if img_file.name.lower() != "thumbs.db":
                         self.samples.append((str(img_file), class_id))
         
-        print(f"   Loaded {len(self.samples)} samples from {len(set([s[1] for s in self.samples]))} classes")
+        print(f"   [Situ] Loaded {len(self.samples)} samples from {len(set([s[1] for s in self.samples]))} classes")
     
     def __len__(self):
         return len(self.samples)
@@ -58,23 +61,17 @@ class SituDataset(Dataset):
             print(f"Error loading image {img_path}: {e}")
             image = Image.new('RGB', (224, 224), color='black')
         
-        if self.transform:
-            image = self.transform(image)
-        
-        label = label - 1
-
-        return image, label
-
+        if self.is_train:
+            img_vis = self.transform_visual(image) if self.transform_visual else image
+            img_col = self.transform_color(image) if self.transform_color else image
+            label = label - 1
+            return (img_vis, img_col), label
+        else:
+            img = self.transform_color(image) if self.transform_color else image
+            label = label - 1
+            return (img, img), label
 
 def create_weighted_sampler(dataset):
-    """
-    
-    Args:
-        dataset: SituDataset
-    
-    Returns:
-        WeightedRandomSampler
-    """
     labels = [label for _, label in dataset.samples]
     class_counts = Counter(labels)
     
@@ -132,133 +129,10 @@ def get_class_weights(dataset, num_classes=None, device='cpu'):
     
     return class_weights
 
-
-def create_data_loaders(
-    data_dir: str,
-    batch_size: int = 32,
-    num_workers: int = 8,  # Tăng từ 4 lên 8-16 để tăng tốc data loading
-    train_split: float = 0.7,
-    val_split: float = 0.15,
-    test_split: float = 0.15,
-    use_weighted_sampling: bool = True
-):
-    """
-    Tạo train/val/test loaders cho situ
-    
-    Args:
-        data_dir: Đường dẫn đến data situ
-        batch_size: Batch size
-        num_workers: Số workers
-        train_split: Tỷ lệ train (mặc định: 0.7)
-        val_split: Tỷ lệ validation (mặc định: 0.15)
-        test_split: Tỷ lệ test (mặc định: 0.15)
-        use_weighted_sampling: Dùng weighted sampling để cân bằng class
-    """
-    transform_train = transforms.Compose([
-        transforms.Resize(256),
-        transforms.RandomCrop(224),
-        transforms.RandomHorizontalFlip(p=0.5),
-    
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-       
-    ])
-    
-    transform_val = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    full_dataset = SituDataset(data_dir, transform=transform_train)
-    
-    # Split: train/val/test
-    total_size = len(full_dataset)
-    train_size = int(total_size * train_split)
-    val_size = int(total_size * val_split)
-    test_size = total_size - train_size - val_size
-    
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-
-    # Update transforms
-    val_dataset.dataset.transform = transform_val
-    test_dataset.dataset.transform = transform_test
-    
-    if use_weighted_sampling:
-        sampler = create_weighted_sampler(full_dataset)
-        
-        train_indices = train_dataset.indices
-        train_labels = [full_dataset.samples[i][1] for i in train_indices]
-        train_class_counts = Counter(train_labels)
-        total_train = len(train_indices)
-        num_classes = len(train_class_counts)
-        
-        train_weights = []
-        for idx in train_indices:
-            label = full_dataset.samples[idx][1]
-            weight = total_train / (num_classes * train_class_counts[label])
-            train_weights.append(weight)
-        
-        train_sampler = WeightedRandomSampler(
-            weights=train_weights,
-            num_samples=len(train_weights),
-            replacement=True
-        )
-        
-        # Trên Kaggle/Colab, persistent_workers có thể gây lỗi
-        # Tắt persistent_workers để tránh worker crash (trade-off: hơi chậm hơn một chút)
-        use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
-        
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, sampler=train_sampler,
-            num_workers=num_workers, pin_memory=True,
-            persistent_workers=use_persistent,
-            prefetch_factor=2 if num_workers > 0 else None  # None nếu num_workers=0
-        )
-        print("   ✅ Using weighted sampling for balanced training")
-    else:
-        use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True,
-            persistent_workers=use_persistent,
-            prefetch_factor=2 if num_workers > 0 else None
-        )
-    
-    use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
-    
-    return train_loader, val_loader, test_loader, len(set([s[1] for s in full_dataset.samples])), full_dataset
-
-
 def unfreeze_all_layers(model: nn.Module):
     for param in model.parameters():
         param.requires_grad = True
     print("✅ Unfrozen: All layers (full fine-tuning)")
-
 
 @torch.no_grad()
 def compute_arcface_accuracy(embeddings, labels, arcface_head):
@@ -272,10 +146,7 @@ def compute_arcface_accuracy(embeddings, labels, arcface_head):
 
 
 def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: str, strict: bool = False):
-    """
-    
-    Args:
-    """
+
     print(f"📂 Loading pretrained checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
@@ -284,15 +155,31 @@ def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: s
     
     if not strict:
         # Handle ArcFace head weight shape mismatch
+        # [FIX] AdaptiveSubCenterArcFace có weight shape (out_features * k, in_features)
         if 'arcface_head.weight' in state_dict:
-            pretrained_num_classes = state_dict['arcface_head.weight'].shape[0]
-            current_num_classes = model_state_dict['arcface_head.weight'].shape[0]
+            pretrained_weight = state_dict['arcface_head.weight']
+            current_weight = model_state_dict['arcface_head.weight']
+            
+            # Tính num_classes từ weight shape (weight shape = num_classes * k)
+            # Giả sử k=3 (default của AdaptiveSubCenterArcFace)
+            pretrained_k = 3  # Có thể detect từ checkpoint nếu cần
+            current_k = getattr(model.arcface_head, 'k', 3)
+            
+            pretrained_num_classes = pretrained_weight.shape[0] // pretrained_k
+            current_num_classes = current_weight.shape[0] // current_k
+            
             if pretrained_num_classes != current_num_classes:
                 print(f"   ⚠️  num_classes mismatch: {pretrained_num_classes} vs {current_num_classes}")
-                print(f"   ⚠️  Skipping arcface_head, will initialize randomly")
+                print(f"   ⚠️  Skipping arcface_head.weight and arcface_head.m, will initialize randomly")
                 state_dict.pop('arcface_head.weight', None)
+                # Cũng skip margin buffer nếu có
+                if 'arcface_head.m' in state_dict:
+                    state_dict.pop('arcface_head.m', None)
     
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    # [FIX] Kiểm tra xem ArcFace head có load được không
+    arcface_not_loaded = 'arcface_head.weight' in missing_keys or 'arcface_head.m' in missing_keys
     
     if missing_keys:
         print(f"   ⚠️  Missing keys (will use random init): {len(missing_keys)}")
@@ -306,163 +193,200 @@ def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: s
     
     print(f"   ✅ Loaded pretrained weights from epoch {checkpoint.get('epoch', '?')}")
     print(f"   ✅ Pretrained val acc: {checkpoint.get('val_acc', 0):.2f}%")
+    
 
-
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=True):
-    """Train 1 epoch với mixed precision để tăng tốc"""
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=False):
     model.train()
     supcon_lambda = getattr(model, "supcon_lambda", 0.0)
     supcon_criterion = getattr(model, "supcon_criterion", None)
+    
     running_loss = 0.0
     correct = 0
     total = 0
     
-    # Handle device: support both string and torch.device
-    if isinstance(device, str):
-        is_cuda = device == 'cuda' and torch.cuda.is_available()
-    else:
-        is_cuda = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
-    # Mixed precision scaler (dùng API mới để tránh deprecation warning)
-    scaler = torch.amp.GradScaler('cuda') if use_amp and is_cuda else None
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
     
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)  # leave=False để không spam terminal
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)  # non_blocking=True để tăng tốc transfer
+    for batch_data, labels in pbar:
+        # [FIX] Unpack tuple ảnh từ Dataset
+        # Dataset trả về: ((img_vis, img_col), label)
+        if isinstance(batch_data, (list, tuple)):
+            images_vis, images_col = batch_data
+        else:
+            images_vis = images_col = batch_data # Fallback nếu lỗi
+            
+        images_vis = images_vis.to(device, non_blocking=True) # Ảnh phá màu
+        images_col = images_col.to(device, non_blocking=True) # Ảnh màu chuẩn
         labels = labels.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        # Mixed precision forward
         if scaler is not None:
-            with torch.cuda.amp.autocast():
-                embeddings = model(images)
-                logits = model.arcface_head(embeddings, labels)
+            with torch.amp.autocast('cuda'):
+                # [FIX] Truyền cả 2 loại ảnh vào model
+                logits, visual_emb, color_emb = model(images_vis, labels, x_color=images_col)
+                
                 loss_arc = criterion(logits, labels)
-
-                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                    final_emb = model.get_final_embedding(images)
-                    loss_sup = supcon_criterion(final_emb, labels)
+                
+                # SupCon học trên Color Embedding (từ ảnh màu chuẩn) -> Vẫn học được màu đúng!
+                if supcon_lambda > 0 and supcon_criterion is not None:
+                    loss_sup = supcon_criterion(color_emb, labels)
                 else:
                     loss_sup = loss_arc.new_tensor(0.0)
 
                 loss = loss_arc + (supcon_lambda * loss_sup)
-            
+
+            if not torch.isfinite(loss):
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            if not torch.isfinite(torch.tensor(grad_norm, device='cpu')):
+                optimizer.zero_grad()
+                continue 
+
+             # --- BACKWARD ---
+            scaler.scale(loss).backward()
+            
+            # [FIX] Unscale để tính norm
+            scaler.unscale_(optimizer)
+            
+            # Clip gradient
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # [FIX QUAN TRỌNG] Check Gradient NaN
+            if not torch.isfinite(torch.tensor(grad_norm, device='cpu')):
+                if epoch == 0 and total < 32:
+                    print(f"   ⚠️  Skipping step (Grad NaN)")
+                
+                optimizer.zero_grad()
+                # [BẮT BUỘC] Phải gọi update() để reset scaler state dù không step()
+                scaler.update() 
+                continue 
+            
             scaler.step(optimizer)
             scaler.update()
         else:
-            embeddings = model(images)
-            logits = model.arcface_head(embeddings, labels)
+            # FP32 Mode (Code tương tự)
+            logits, visual_emb, color_emb = model(images_vis, labels, x_color=images_col)
             loss_arc = criterion(logits, labels)
-
-            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                final_emb = model.get_final_embedding(images)
-                loss_sup = supcon_criterion(final_emb, labels)
-            else:
-                loss_sup = loss_arc.new_tensor(0.0)
-
+            loss_sup = supcon_criterion(color_emb, labels) if (supcon_lambda > 0) else 0.0
             loss = loss_arc + (supcon_lambda * loss_sup)
+            
+            if not torch.isfinite(loss): continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if not torch.isfinite(torch.tensor(grad_norm, device='cpu')): continue
             optimizer.step()
-        
+
         running_loss += loss.item()
         total += labels.size(0)
-        # Tính accuracy mỗi batch (cần thiết cho tracking)
         with torch.no_grad():
-            correct += compute_arcface_accuracy(embeddings.detach(), labels, model.arcface_head)
+            pred = logits.argmax(dim=1)
+            correct += pred.eq(labels).sum().item()
         
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
     
-    epoch_loss = running_loss / len(train_loader)
+    epoch_loss = running_loss / len(train_loader) if len(train_loader) > 0 else 0
     epoch_acc = 100. * correct / total if total > 0 else 0.0
     return epoch_loss, epoch_acc
 
-
 @torch.no_grad()
-def validate(model, val_loader, criterion, device, use_amp=True):
-    """Validate model với mixed precision để tăng tốc"""
+def validate(model, val_loader, criterion, device, epoch: int = 0, use_amp=False):
+    """
+    Validate model với cơ chế tính Accuracy có Margin y hệt lúc Train
+    để theo dõi chính xác độ hội tụ trên tập Vitro/Situ.
+    """
     model.eval()
     supcon_lambda = getattr(model, "supcon_lambda", 0.0)
     supcon_criterion = getattr(model, "supcon_criterion", None)
+    
     running_loss = 0.0
     correct = 0
     total = 0
     
-    # Handle device: support both string and torch.device
-    if isinstance(device, str):
-        is_cuda = device == 'cuda' and torch.cuda.is_available()
-    else:
-        is_cuda = device.type == 'cuda'
+    pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Val]", leave=False)
     
-    pbar = tqdm(val_loader, desc="[Val]", leave=False)  # leave=False
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)  # non_blocking=True
+    for batch_data, labels in pbar:
+        # 1. Unpack dữ liệu: Dataset trả về ((img_vis, img_col), label)
+        if isinstance(batch_data, (list, tuple)):
+            # Lúc Val ta dùng ảnh visual (vis) làm chuẩn cho cả 2 nhánh
+            images_vis, images_col = batch_data
+        else:
+            images_vis = images_col = batch_data
+            
+        images_vis = images_vis.to(device, non_blocking=True)
+        images_col = images_col.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
-        if use_amp and is_cuda:
-            with torch.cuda.amp.autocast():
-                embeddings = model(images)
-                logits = model.arcface_head(embeddings, labels)
+        # 2. Forward pass
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                # Ở mode eval(), model trả về 2 giá trị: (visual_emb, color_emb)
+                visual_emb, color_emb = model(images_vis)
+                
+                # [QUAN TRỌNG] Tự tính logits có margin để tính Acc giống Train
+                logits = model.arcface_head(visual_emb, labels)
+                
+                # Tính Loss ArcFace
                 loss_arc = criterion(logits, labels)
-
-                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                    final_emb = model.get_final_embedding(images)
-                    loss_sup = supcon_criterion(final_emb, labels)
+                
+                # Tính Loss SupCon (nếu có)
+                if supcon_lambda > 0 and supcon_criterion is not None:
+                    loss_sup = supcon_criterion(color_emb, labels)
                 else:
                     loss_sup = loss_arc.new_tensor(0.0)
-
+                    
                 loss = loss_arc + (supcon_lambda * loss_sup)
         else:
-            embeddings = model(images)
-            logits = model.arcface_head(embeddings, labels)
+            # Mode FP32
+            visual_emb, color_emb = model(images_vis)
+            logits = model.arcface_head(visual_emb, labels)
+            
             loss_arc = criterion(logits, labels)
-
-            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                final_emb = model.get_final_embedding(images)
-                loss_sup = supcon_criterion(final_emb, labels)
-            else:
-                loss_sup = loss_arc.new_tensor(0.0)
-
+            loss_sup = supcon_criterion(color_emb, labels) if supcon_lambda > 0 else 0.0
             loss = loss_arc + (supcon_lambda * loss_sup)
-        
+
+        # 3. Thống kê
         running_loss += loss.item()
         total += labels.size(0)
-        correct += compute_arcface_accuracy(embeddings, labels, model.arcface_head)
         
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
+        # Accuracy tính bằng argmax của Logits (có Margin)
+        with torch.no_grad():
+            pred = logits.argmax(dim=1)
+            correct += pred.eq(labels).sum().item()
+        
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
     
-    epoch_loss = running_loss / len(val_loader)
-    epoch_acc = 100. * correct / total
+    # Trả về trung bình loss và accuracy của epoch
+    epoch_loss = running_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+    epoch_acc = 100. * correct / total if total > 0 else 0.0
+    
     return epoch_loss, epoch_acc
-
 
 @torch.no_grad()
 def extract_embeddings(model, data_loader, device):
-    """Extract embeddings và labels từ data_loader"""
     model.eval()
-    embeddings = []
+    visual_embeddings = []
     labels = []
     
-    for images, batch_labels in tqdm(data_loader, desc="Extracting embeddings"):
+    for batch_data, batch_labels in tqdm(data_loader, desc="Extracting"):
+        # [FIX] Handle tuple
+        if isinstance(batch_data, (list, tuple)):
+            images, _ = batch_data
+        else:
+            images = batch_data
+            
         images = images.to(device)
-        batch_embeddings = model(images)
-        embeddings.append(batch_embeddings.cpu())
+        visual_emb, _ = model(images)
+        visual_embeddings.append(visual_emb.cpu())
         labels.append(batch_labels)
     
-    embeddings = torch.cat(embeddings, dim=0).numpy()
-    labels = torch.cat(labels, dim=0).numpy()
-    
-    return embeddings, labels
+    return torch.cat(visual_embeddings, dim=0).numpy(), torch.cat(labels, dim=0).numpy()
 
 
 def compute_recall_at_k(test_emb, gallery_emb, test_labels, gallery_labels, k=5, device="cpu"):
@@ -518,7 +442,6 @@ def compute_precision_at_1(test_emb, gallery_emb, test_labels, gallery_labels, d
     precision = correct / len(test_labels)
     
     return precision
-
 
 def compute_mean_average_precision(test_emb, gallery_emb, test_labels, gallery_labels, device="cpu"):
     """Tính Mean Average Precision (mAP)"""
@@ -653,6 +576,124 @@ def evaluate_test(model, test_loader, train_loader, criterion, device):
         'gallery_labels': gallery_labels
     }
 
+def create_data_loaders(
+    data_dir: str,
+    batch_size: int = 32,
+    num_workers: int = 8, 
+    train_split: float = 0.7,
+    val_split: float = 0.10,
+    test_split: float = 0.20,
+    use_weighted_sampling: bool = True,
+    dataset_type: str = 'situ' 
+):
+    if dataset_type == 'situ':
+        transform_visual_train = transforms.Compose([
+            transforms.Resize(256),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(p=0.5),
+            # --- Augmentation màu mạnh ---
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.1)
+        ])
+    else:
+        transform_visual_train = transforms.Compose([
+            transforms.Resize(256),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.1)
+        ])
+    
+    # 2. Transform chuẩn cho Color (Train) và All (Val/Test)
+    transform_clean = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224), # Val/Test dùng CenterCrop
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Transform chuẩn cho Color branch lúc Train (Có thể RandomCrop nhẹ)
+    transform_color_train = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomCrop(224),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # Chọn class Dataset
+    DatasetClass = SituDataset
+    full_dataset = SituDataset(data_dir, transform_visual=transform_visual_train)
+
+    # [FIX QUAN TRỌNG] Tạo 2 dataset riêng biệt để tránh lỗi reference
+    # Dataset 1: Dùng cho Train (is_train=True)
+    full_train_dataset = DatasetClass(
+        data_dir, 
+        transform_visual=transform_visual_train, 
+        transform_color=transform_color_train, 
+        is_train=True
+    )
+    
+    # Dataset 2: Dùng cho Val/Test (is_train=False)
+    full_val_dataset = DatasetClass(
+        data_dir, 
+        transform_visual=None, 
+        transform_color=transform_clean, 
+        is_train=False
+    )
+    
+    # Tính toán indices để split
+    total_size = len(full_train_dataset)
+    train_size = int(total_size * train_split)
+    val_size = int(total_size * val_split)
+    test_size = total_size - train_size - val_size
+    
+    # Tạo indices ngẫu nhiên
+    indices = torch.randperm(total_size).tolist()
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size : train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+    
+    # Tạo Subset từ đúng dataset nguồn
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_dataset = Subset(full_val_dataset, val_indices)   # Lấy từ dataset Val
+    test_dataset = Subset(full_val_dataset, test_indices) # Lấy từ dataset Val
+    
+    # Weighted Sampler logic
+    if use_weighted_sampling:
+        # Lấy label từ full_train_dataset thông qua indices
+        train_labels = [full_train_dataset.samples[i][1] for i in train_indices]
+        class_counts = Counter(train_labels)
+        
+        weights = []
+        for i in train_indices:
+            label = full_train_dataset.samples[i][1]
+            # Tránh chia cho 0 nếu count lỗi
+            count = class_counts[label] if class_counts[label] > 0 else 1
+            weights.append(1.0 / count)
+            
+        train_sampler = WeightedRandomSampler(weights, len(weights))
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, 
+                                  num_workers=num_workers, pin_memory=True, persistent_workers=False)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                  num_workers=num_workers, pin_memory=True, persistent_workers=False)
+
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                            num_workers=num_workers, pin_memory=True, persistent_workers=False)
+    
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                             num_workers=num_workers, pin_memory=True, persistent_workers=False)
+    
+    raw_ids = [cid for _, cid in full_train_dataset.samples] 
+    max_label = max(raw_ids) - 1                        
+    num_classes = int(max_label + 1)
+    return train_loader, val_loader, test_loader, num_classes, full_dataset
 
 def main():
     parser = argparse.ArgumentParser(description='Fine-tune ResMobileNetV2 on in-situ dataset')
@@ -715,15 +756,21 @@ def main():
     
     print("\n🏗️  Creating model...")
     inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
+    
+    # Tính class counts cho adaptive margin (nếu cần)
+    class_counts = None  # Có thể tính từ dataset nếu cần
+    
     model = ResMobileNetV2(
         inverted_residual_setting=inverted_residual_setting,
         embedding_size=args.embedding_size,
         num_classes=num_classes,
         use_color_embedding=args.use_color_embedding,
-        color_embedding_size=args.color_embedding_size
+        color_embedding_size=args.color_embedding_size,
+        arcface_s=22.5,  # Giảm từ 30.0 → 22.5 để margin mềm hơn, model linh hoạt hơn
+        class_counts=class_counts,
+        dropout_rate=0.45  # Tăng từ 0.3 → 0.45 để giảm overfitting
     ).to(args.device)
 
-    model.color_alpha = args.color_alpha if hasattr(model, "color_alpha") else args.color_alpha
     model.supcon_lambda = float(args.supcon_lambda)
     model.supcon_criterion = SupConLoss(temperature=args.supcon_temp) if args.supcon_lambda > 0 else None
     
@@ -732,14 +779,16 @@ def main():
     unfreeze_all_layers(model)
     
     # Label smoothing để giảm overfitting (giảm confidence quá cao)
+    # Tăng từ 0.1 → 0.25 để model linh hoạt hơn, không quá khắt khe
+    label_smoothing = 0.25
     if args.use_class_weights:
         class_weights = get_class_weights(full_dataset, num_classes=num_classes, device=args.device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        print(f"\n   ✅ Using class weights + label smoothing in loss function")
+        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
+        print(f"\n   ✅ Using class weights + label smoothing ({label_smoothing}) in loss function")
         print(f"   Weight range: {class_weights.min():.2f} - {class_weights.max():.2f}")
     else:
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-        print(f"\n   ✅ Using label smoothing (0.1) to reduce overfitting")
+        criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        print(f"\n   ✅ Using label smoothing ({label_smoothing}) to make model more flexible")
     
     stem_params = list(model.conv1.parameters()) + list(model.bn1.parameters()) + \
                   list(model.transition.parameters())
@@ -789,15 +838,9 @@ def main():
     print(f"   Batch size: {args.batch_size}\n")
     
     for epoch in range(start_epoch, args.epochs):
-        # ArcFace margin warm-up
-        if args.arcface_margin_start is not None and hasattr(model, "arcface_head"):
-            warm = max(int(args.arcface_warmup_epochs), 1)
-            t = min(max(epoch / warm, 0.0), 1.0)
-            m = float(args.arcface_margin_start + t * (args.arcface_margin_end - args.arcface_margin_start))
-            if hasattr(model.arcface_head, "set_margin"):
-                model.arcface_head.set_margin(m)
-            else:
-                model.arcface_head.m = m
+        # ArcFace margin warm-up: AdaptiveSubCenterArcFace không hỗ trợ margin warmup trực tiếp
+        # Margin được tính từ class_counts trong __init__, không cần warmup
+        pass
 
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, args.device, epoch)
         

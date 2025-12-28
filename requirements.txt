@@ -33,6 +33,6 @@ scikit-learn>=1.0.0
 
 # Visualization
 matplotlib>=3.5.0
-
+ultralytics
 # Project
 -e .

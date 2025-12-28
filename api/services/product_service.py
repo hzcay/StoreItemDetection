@@ -11,6 +11,45 @@ from ultralytics import YOLO
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+
+# Cache YOLO model để không load lại mỗi request
+_YOLO_MODEL_CACHE_SERVICE = None
+
+def get_yolo_model_service():
+    """Get YOLO model với caching - ưu tiên custom model đã train"""
+    global _YOLO_MODEL_CACHE_SERVICE
+    if _YOLO_MODEL_CACHE_SERVICE is not None:
+        return _YOLO_MODEL_CACHE_SERVICE
+    
+    # Ưu tiên dùng custom model đã train trước
+    try:
+        base_dir = os.path.dirname(__file__) 
+        yolo_model_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
+        if os.path.exists(yolo_model_path):
+            _YOLO_MODEL_CACHE_SERVICE = YOLO(yolo_model_path)
+            print(f"✅ Using custom YOLO model: {yolo_model_path} (cached)")
+            return _YOLO_MODEL_CACHE_SERVICE
+    except Exception as e:
+        print(f"⚠️  Custom model not found, trying pretrained: {e}")
+    
+    # Fallback về pretrained models nếu không có custom
+    model_options = [
+        'yolo11x.pt',  # YOLOv11 xlarge - fallback
+        'yolo11l.pt',  # YOLOv11 large - fallback
+        'yolo8x.pt',   # YOLOv8 xlarge - fallback
+        'yolo8l.pt',   # YOLOv8 large - fallback
+    ]
+    
+    for model_name in model_options:
+        try:
+            _YOLO_MODEL_CACHE_SERVICE = YOLO(model_name)
+            print(f"✅ Using {model_name} pretrained model (cached)")
+            return _YOLO_MODEL_CACHE_SERVICE
+        except Exception as e:
+            continue
+    
+    raise Exception("No YOLO model available. Please ensure custom model exists or ultralytics can download pretrained models.")
+
 class ProductService:
     def __init__(self, db: Session):
         self.db = db
@@ -25,11 +64,8 @@ class ProductService:
         if image is None:
             return []
 
-        # Load YOLO model
-        base_dir = os.path.dirname(__file__)  # folder of product_service.py
-        model_path = os.path.join(base_dir, "..", "models", "best_new_15_12.pt")
-        model = YOLO(model_path)
-
+        # Load YOLO model (cached) - ưu tiên YOLOv11x pretrained (mạnh nhất)
+        model = get_yolo_model_service()
 
         # Read uploaded image bytes
         image_bytes = image.file.read()
@@ -39,8 +75,8 @@ class ProductService:
         if img is None:
             return []
 
-        # Run detection
-        results = model(img)
+        # Run detection với confidence threshold và NMS tốt hơn
+        results = model(img, conf=0.25, iou=0.45, verbose=False)
         detections = results[0]
 
         # Extract all crops

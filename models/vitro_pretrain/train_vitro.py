@@ -19,145 +19,51 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
 
+from collections import Counter
+from torch.utils.data import Subset, WeightedRandomSampler
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
 from models.losses.supcon_loss import SupConLoss
-
 class VitroDataset(Dataset):
-    def __init__(self, data_dir: str, transform=None):
+    def __init__(self, data_dir: str, transform_visual=None, transform_color=None, is_train=True):
         self.data_dir = Path(data_dir)
-        self.transform = transform
+        self.transform_visual = transform_visual
+        self.transform_color = transform_color
+        self.is_train = is_train
         self.samples = []
         
+        # Logic riêng Vitro: web/JPEG/*.jpg và web/PNG/*.png
         for class_dir in sorted(self.data_dir.iterdir()):
-            if not class_dir.is_dir():
-                continue
-            
+            if not class_dir.is_dir(): continue
             try:
                 class_id = int(class_dir.name)
-            except ValueError:
-                continue
+            except ValueError: continue
             
             web_dir = class_dir / "web"
             if web_dir.exists():
-                jpeg_dir = web_dir / "JPEG"
-                if jpeg_dir.exists():
-                    for img_file in sorted(jpeg_dir.glob("*.jpg")):
-                        if img_file.name.lower() != "thumbs.db":
-                            self.samples.append((str(img_file), class_id))
-                
-                png_dir = web_dir / "PNG"
-                if png_dir.exists():
-                    for img_file in sorted(png_dir.glob("*.png")):
-                        if img_file.name.lower() != "thumbs.db":
-                            self.samples.append((str(img_file), class_id))
+                # JPEG
+                for img_file in sorted((web_dir / "JPEG").glob("*.jpg")) if (web_dir / "JPEG").exists() else []:
+                    self.samples.append((str(img_file), class_id))
+                # PNG
+                for img_file in sorted((web_dir / "PNG").glob("*.png")) if (web_dir / "PNG").exists() else []:
+                    self.samples.append((str(img_file), class_id))
         
-        print(f"   Loaded {len(self.samples)} samples from {len(set([s[1] for s in self.samples]))} classes")
-    
-    def __len__(self):
-        return len(self.samples)
-    
+        print(f" [Vitro] Loaded {len(self.samples)} samples from {len(set([s[1] for s in self.samples]))} classes")
+
+    def __len__(self): return len(self.samples)
+
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"Error loading image {img_path}: {e}")
-            image = Image.new('RGB', (224, 224), color='black')
-        
-        if self.transform:
-            image = self.transform(image)
-        
-        label = label - 1
-
-        return image, label
-
-
-def create_data_loaders(
-    data_dir: str,
-    batch_size: int = 32,
-    num_workers: int = 8,  # Tăng từ 4 lên 8 để tăng tốc data loading
-    train_split: float = 0.7,
-    val_split: float = 0.15,
-    test_split: float = 0.15
-):
-    """
-    Tạo train/val/test loaders
-    
-    Args:
-        train_split: Tỷ lệ train (mặc định: 0.7)
-        val_split: Tỷ lệ validation (mặc định: 0.15)
-        test_split: Tỷ lệ test (mặc định: 0.15)
-    """
-    transform_train = transforms.Compose([
-        transforms.Resize(256),
-        transforms.RandomCrop(224),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    transform_val = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    transform_test = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    
-    full_dataset = VitroDataset(data_dir, transform=transform_train)
-    
-    # Split: train/val/test
-    total_size = len(full_dataset)
-    train_size = int(total_size * train_split)
-    val_size = int(total_size * val_split)
-    test_size = total_size - train_size - val_size
-    
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-    
-    # Update transforms
-    val_dataset.dataset.transform = transform_val
-    test_dataset.dataset.transform = transform_test
-    
-    # Trên Kaggle/Colab, persistent_workers có thể gây lỗi
-    # Tắt persistent_workers để tránh worker crash (trade-off: hơi chậm hơn một chút)
-    use_persistent = False  # Set False để tránh lỗi trên Kaggle/Colab
-    
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-        prefetch_factor=2 if num_workers > 0 else None  # None nếu num_workers=0
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True,
-        persistent_workers=use_persistent,
-        prefetch_factor=2 if num_workers > 0 else None
-    )
-    
-    return train_loader, val_loader, test_loader, len(set([s[1] for s in full_dataset.samples]))
-
+        image = Image.open(img_path).convert('RGB')
+        if self.is_train:
+            return (self.transform_visual(image), self.transform_color(image)), label - 1
+        else:
+            img = self.transform_color(image)
+            return (img, img), label - 1
 
 def freeze_layers(model: nn.Module, freeze_stem: bool = True, freeze_mobile: bool = False):
     """
@@ -181,7 +87,6 @@ def freeze_layers(model: nn.Module, freeze_stem: bool = True, freeze_mobile: boo
             param.requires_grad = False
         print("✅ Frozen: MobileNet mid-blocks")
     
-    # Luôn train ResNet tail và embedding head
     print("✅ Training: ResNet tail + Embedding head")
 
 
@@ -195,188 +100,198 @@ def compute_arcface_accuracy(embeddings, labels, arcface_head):
     correct = predicted.eq(labels).sum().item()
     return correct
 
-
-def train_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=True):
-    """Train 1 epoch với mixed precision để tăng tốc"""
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, use_amp=False):
     model.train()
+    supcon_lambda = getattr(model, "supcon_lambda", 0.0)
+    supcon_criterion = getattr(model, "supcon_criterion", None)
+    
     running_loss = 0.0
     correct = 0
     total = 0
     
-    # Handle device: support both string and torch.device
-    if isinstance(device, str):
-        is_cuda = device == 'cuda' and torch.cuda.is_available()
-    else:
-        is_cuda = device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
     
-    # Mixed precision scaler (dùng API mới để tránh deprecation warning)
-    scaler = torch.amp.GradScaler('cuda') if use_amp and is_cuda else None
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)
     
-    # Classifier warm-up (CE head) to stabilize embedding distribution before ArcFace
-    ce_warmup_epochs = int(getattr(model, "ce_warmup_epochs", 0) or 0)
-    ce_head = getattr(model, "ce_head", None)
-
-    # SupCon (loss phụ) - train color branch trên final embedding, không phá ArcFace boundary
-    # Nếu model không bật color embedding hoặc supcon_lambda=0, loss_supcon sẽ bị skip.
-    supcon_lambda = getattr(model, "supcon_lambda", 0.0)
-    supcon_criterion = getattr(model, "supcon_criterion", None)
-
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]", leave=False)  # leave=False để không spam terminal
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)  # non_blocking=True để tăng tốc transfer
+    for batch_data, labels in pbar:
+        # [FIX] Unpack tuple ảnh từ Dataset
+        # Dataset trả về: ((img_vis, img_col), label)
+        if isinstance(batch_data, (list, tuple)):
+            images_vis, images_col = batch_data
+        else:
+            images_vis = images_col = batch_data # Fallback nếu lỗi
+            
+        images_vis = images_vis.to(device, non_blocking=True) # Ảnh phá màu
+        images_col = images_col.to(device, non_blocking=True) # Ảnh màu chuẩn
         labels = labels.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         
-        # Mixed precision forward
         if scaler is not None:
-            with torch.cuda.amp.autocast():
-                embeddings = model(images)
-                # Warm-up: CE head first, then ArcFace
-                if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
-                    logits = ce_head(embeddings)
-                else:
-                    logits = model.arcface_head(embeddings, labels)
+            with torch.amp.autocast('cuda'):
+                # [FIX] Truyền cả 2 loại ảnh vào model
+                logits, visual_emb, color_emb = model(images_vis, labels, x_color=images_col)
+                
                 loss_arc = criterion(logits, labels)
-
-                # SupCon on final embedding (visual ⊕ α·color)
-                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                    final_emb = model.get_final_embedding(images)
-                    loss_sup = supcon_criterion(final_emb, labels)
+                
+                # SupCon học trên Color Embedding (từ ảnh màu chuẩn) -> Vẫn học được màu đúng!
+                if supcon_lambda > 0 and supcon_criterion is not None:
+                    loss_sup = supcon_criterion(color_emb, labels)
                 else:
                     loss_sup = loss_arc.new_tensor(0.0)
 
                 loss = loss_arc + (supcon_lambda * loss_sup)
-            
+
+            if not torch.isfinite(loss):
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)  # Unscale trước khi clip
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            if not torch.isfinite(torch.tensor(grad_norm, device='cpu')):
+                optimizer.zero_grad()
+                continue 
+
+             # --- BACKWARD ---
+            scaler.scale(loss).backward()
+            
+            # [FIX] Unscale để tính norm
+            scaler.unscale_(optimizer)
+            
+            # Clip gradient
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # [FIX QUAN TRỌNG] Check Gradient NaN
+            if not torch.isfinite(torch.tensor(grad_norm, device='cpu')):
+                if epoch == 0 and total < 32:
+                    print(f"   ⚠️  Skipping step (Grad NaN)")
+                
+                optimizer.zero_grad()
+                # [BẮT BUỘC] Phải gọi update() để reset scaler state dù không step()
+                scaler.update() 
+                continue 
+            
             scaler.step(optimizer)
             scaler.update()
         else:
-            embeddings = model(images)
-            if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
-                logits = ce_head(embeddings)
-            else:
-                logits = model.arcface_head(embeddings, labels)
+            # FP32 Mode (Code tương tự)
+            logits, visual_emb, color_emb = model(images_vis, labels, x_color=images_col)
             loss_arc = criterion(logits, labels)
-
-            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                final_emb = model.get_final_embedding(images)
-                loss_sup = supcon_criterion(final_emb, labels)
-            else:
-                loss_sup = loss_arc.new_tensor(0.0)
-
+            loss_sup = supcon_criterion(color_emb, labels) if (supcon_lambda > 0) else 0.0
             loss = loss_arc + (supcon_lambda * loss_sup)
+            
+            if not torch.isfinite(loss): continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if not torch.isfinite(torch.tensor(grad_norm, device='cpu')): continue
             optimizer.step()
-        
+
         running_loss += loss.item()
         total += labels.size(0)
-        # Accuracy based on current logits (works for CE warmup + ArcFace)
         with torch.no_grad():
             pred = logits.argmax(dim=1)
             correct += pred.eq(labels).sum().item()
         
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
     
-    epoch_loss = running_loss / len(train_loader)
+    epoch_loss = running_loss / len(train_loader) if len(train_loader) > 0 else 0
     epoch_acc = 100. * correct / total if total > 0 else 0.0
     return epoch_loss, epoch_acc
 
-
 @torch.no_grad()
-def validate(model, val_loader, criterion, device, epoch: int = 0, use_amp=True):
-    """Validate model với mixed precision để tăng tốc"""
+def validate(model, val_loader, criterion, device, epoch: int = 0, use_amp=False):
+    """
+    Validate model với cơ chế tính Accuracy có Margin y hệt lúc Train
+    để theo dõi chính xác độ hội tụ trên tập Vitro/Situ.
+    """
     model.eval()
     supcon_lambda = getattr(model, "supcon_lambda", 0.0)
     supcon_criterion = getattr(model, "supcon_criterion", None)
-    ce_warmup_epochs = int(getattr(model, "ce_warmup_epochs", 0) or 0)
-    ce_head = getattr(model, "ce_head", None)
+    
     running_loss = 0.0
     correct = 0
     total = 0
     
-    # Handle device: support both string and torch.device
-    if isinstance(device, str):
-        is_cuda = device == 'cuda' and torch.cuda.is_available()
-    else:
-        is_cuda = device.type == 'cuda'
+    pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Val]", leave=False)
     
-    pbar = tqdm(val_loader, desc="[Val]", leave=False)  # leave=False
-    for images, labels in pbar:
-        images = images.to(device, non_blocking=True)  # non_blocking=True
+    for batch_data, labels in pbar:
+        # 1. Unpack dữ liệu: Dataset trả về ((img_vis, img_col), label)
+        if isinstance(batch_data, (list, tuple)):
+            # Lúc Val ta dùng ảnh visual (vis) làm chuẩn cho cả 2 nhánh
+            images_vis, images_col = batch_data
+        else:
+            images_vis = images_col = batch_data
+            
+        images_vis = images_vis.to(device, non_blocking=True)
+        images_col = images_col.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         
-        if use_amp and is_cuda:
-            with torch.cuda.amp.autocast():
-                embeddings = model(images)
-                if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
-                    logits = ce_head(embeddings)
-                else:
-                    logits = model.arcface_head(embeddings, labels)
+        # 2. Forward pass
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                # Ở mode eval(), model trả về 2 giá trị: (visual_emb, color_emb)
+                visual_emb, color_emb = model(images_vis)
+                
+                # [QUAN TRỌNG] Tự tính logits có margin để tính Acc giống Train
+                logits = model.arcface_head(visual_emb, labels)
+                
+                # Tính Loss ArcFace
                 loss_arc = criterion(logits, labels)
-
-                if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                    final_emb = model.get_final_embedding(images)
-                    loss_sup = supcon_criterion(final_emb, labels)
+                
+                # Tính Loss SupCon (nếu có)
+                if supcon_lambda > 0 and supcon_criterion is not None:
+                    loss_sup = supcon_criterion(color_emb, labels)
                 else:
                     loss_sup = loss_arc.new_tensor(0.0)
-
+                    
                 loss = loss_arc + (supcon_lambda * loss_sup)
         else:
-            embeddings = model(images)
-            if ce_warmup_epochs > 0 and epoch < ce_warmup_epochs and ce_head is not None:
-                logits = ce_head(embeddings)
-            else:
-                logits = model.arcface_head(embeddings, labels)
+            # Mode FP32
+            visual_emb, color_emb = model(images_vis)
+            logits = model.arcface_head(visual_emb, labels)
+            
             loss_arc = criterion(logits, labels)
-
-            if supcon_lambda > 0 and supcon_criterion is not None and getattr(model, "use_color_embedding", False):
-                final_emb = model.get_final_embedding(images)
-                loss_sup = supcon_criterion(final_emb, labels)
-            else:
-                loss_sup = loss_arc.new_tensor(0.0)
-
+            loss_sup = supcon_criterion(color_emb, labels) if supcon_lambda > 0 else 0.0
             loss = loss_arc + (supcon_lambda * loss_sup)
-        
+
+        # 3. Thống kê
         running_loss += loss.item()
         total += labels.size(0)
-        pred = logits.argmax(dim=1)
-        correct += pred.eq(labels).sum().item()
         
-        pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'acc': f'{100.*correct/total:.2f}%'
-        })
+        # Accuracy tính bằng argmax của Logits (có Margin)
+        with torch.no_grad():
+            pred = logits.argmax(dim=1)
+            correct += pred.eq(labels).sum().item()
+        
+        pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{100.*correct/total:.2f}%'})
     
-    epoch_loss = running_loss / len(val_loader)
-    epoch_acc = 100. * correct / total
+    # Trả về trung bình loss và accuracy của epoch
+    epoch_loss = running_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+    epoch_acc = 100. * correct / total if total > 0 else 0.0
+    
     return epoch_loss, epoch_acc
-
 
 @torch.no_grad()
 def extract_embeddings(model, data_loader, device):
-    """Extract embeddings và labels từ data_loader"""
     model.eval()
-    embeddings = []
+    visual_embeddings = []
     labels = []
     
-    for images, batch_labels in tqdm(data_loader, desc="Extracting embeddings"):
+    for batch_data, batch_labels in tqdm(data_loader, desc="Extracting"):
+        # [FIX] Handle tuple
+        if isinstance(batch_data, (list, tuple)):
+            images, _ = batch_data
+        else:
+            images = batch_data
+            
         images = images.to(device)
-        batch_embeddings = model(images)
-        embeddings.append(batch_embeddings.cpu())
+        visual_emb, _ = model(images)
+        visual_embeddings.append(visual_emb.cpu())
         labels.append(batch_labels)
     
-    embeddings = torch.cat(embeddings, dim=0).numpy()
-    labels = torch.cat(labels, dim=0).numpy()
-    
-    return embeddings, labels
-
+    return torch.cat(visual_embeddings, dim=0).numpy(), torch.cat(labels, dim=0).numpy()
 
 def compute_recall_at_k(test_emb, gallery_emb, test_labels, gallery_labels, k=5, device="cpu"):
     """Tính Recall@k"""
@@ -565,6 +480,123 @@ def evaluate_test(model, test_loader, train_loader, criterion, device):
         'gallery_labels': gallery_labels
     }
 
+def create_data_loaders(
+    data_dir: str,
+    batch_size: int = 32,
+    num_workers: int = 8, 
+    train_split: float = 0.7,
+    val_split: float = 0.10,
+    test_split: float = 0.20,
+    use_weighted_sampling: bool = True,
+    dataset_type: str = 'situ' 
+):
+    if dataset_type == 'situ':
+        transform_visual_train = transforms.Compose([
+            transforms.Resize(256),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(p=0.5),
+            # --- Augmentation màu mạnh ---
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.1)
+        ])
+    else:
+        transform_visual_train = transforms.Compose([
+            transforms.Resize(256),
+            transforms.RandomCrop(224),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.RandomErasing(p=0.1)
+        ])
+    
+    # 2. Transform chuẩn cho Color (Train) và All (Val/Test)
+    transform_clean = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224), # Val/Test dùng CenterCrop
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Transform chuẩn cho Color branch lúc Train (Có thể RandomCrop nhẹ)
+    transform_color_train = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomCrop(224),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    # Chọn class Dataset
+    DatasetClass = VitroDataset
+
+    # [FIX QUAN TRỌNG] Tạo 2 dataset riêng biệt để tránh lỗi reference
+    # Dataset 1: Dùng cho Train (is_train=True)
+    full_train_dataset = DatasetClass(
+        data_dir, 
+        transform_visual=transform_visual_train, 
+        transform_color=transform_color_train, 
+        is_train=True
+    )
+    
+    # Dataset 2: Dùng cho Val/Test (is_train=False)
+    full_val_dataset = DatasetClass(
+        data_dir, 
+        transform_visual=None, 
+        transform_color=transform_clean, 
+        is_train=False
+    )
+    
+    # Tính toán indices để split
+    total_size = len(full_train_dataset)
+    train_size = int(total_size * train_split)
+    val_size = int(total_size * val_split)
+    test_size = total_size - train_size - val_size
+    
+    # Tạo indices ngẫu nhiên
+    indices = torch.randperm(total_size).tolist()
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size : train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+    
+    # Tạo Subset từ đúng dataset nguồn
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_dataset = Subset(full_val_dataset, val_indices)   # Lấy từ dataset Val
+    test_dataset = Subset(full_val_dataset, test_indices) # Lấy từ dataset Val
+    
+    # Weighted Sampler logic
+    if use_weighted_sampling:
+        # Lấy label từ full_train_dataset thông qua indices
+        train_labels = [full_train_dataset.samples[i][1] for i in train_indices]
+        class_counts = Counter(train_labels)
+        
+        weights = []
+        for i in train_indices:
+            label = full_train_dataset.samples[i][1]
+            # Tránh chia cho 0 nếu count lỗi
+            count = class_counts[label] if class_counts[label] > 0 else 1
+            weights.append(1.0 / count)
+            
+        train_sampler = WeightedRandomSampler(weights, len(weights))
+        
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, 
+                                  num_workers=num_workers, pin_memory=True, persistent_workers=False)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, 
+                                  num_workers=num_workers, pin_memory=True, persistent_workers=False)
+
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, 
+                            num_workers=num_workers, pin_memory=True, persistent_workers=False)
+    
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, 
+                             num_workers=num_workers, pin_memory=True, persistent_workers=False)
+    
+    raw_ids = [cid for _, cid in full_train_dataset.samples] 
+    max_label = max(raw_ids) - 1                        
+    num_classes = int(max_label + 1)
+    return train_loader, val_loader, test_loader, num_classes
 
 def main():
     parser = argparse.ArgumentParser(description='Train ResMobileNetV2 on in-vitro dataset')
@@ -631,27 +663,27 @@ def main():
     
     print("\n🏗️  Creating model...")
     inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
+    
+    # Tính class counts cho adaptive margin (nếu cần)
+    class_counts = None  # Có thể tính từ dataset nếu cần
+    
     model = ResMobileNetV2(
         inverted_residual_setting=inverted_residual_setting,
         embedding_size=args.embedding_size,
         num_classes=num_classes,
         use_color_embedding=args.use_color_embedding,
-        color_embedding_size=args.color_embedding_size
+        color_embedding_size=args.color_embedding_size,
+        arcface_s=float(args.arcface_scale),
+        class_counts=class_counts
     ).to(args.device)
 
-    # Attach SupCon config to model (simple wiring without refactoring train_epoch signature)
-    model.color_alpha = args.color_alpha if hasattr(model, "color_alpha") else args.color_alpha
+    # Attach SupCon config to model
     model.supcon_lambda = float(args.supcon_lambda)
     model.supcon_criterion = SupConLoss(temperature=args.supcon_temp) if args.supcon_lambda > 0 else None
 
-    # Attach CE warmup head + ArcFace hyperparams
+    # Attach CE warmup head
     model.ce_warmup_epochs = int(args.ce_warmup_epochs)
     model.ce_head = nn.Linear(args.embedding_size, num_classes).to(args.device) if args.ce_warmup_epochs > 0 else None
-    model.arcface_head.s = float(args.arcface_scale)
-    if hasattr(model.arcface_head, "set_margin"):
-        model.arcface_head.set_margin(float(args.arcface_margin))
-    else:
-        model.arcface_head.m = float(args.arcface_margin)
     
     if args.freeze_stem or args.freeze_mobile:
         freeze_layers(model, freeze_stem=args.freeze_stem, freeze_mobile=args.freeze_mobile)
@@ -699,16 +731,9 @@ def main():
     print(f"   Batch size: {args.batch_size}\n")
     
     for epoch in range(start_epoch, args.epochs):
-        # ArcFace margin warm-up: epoch 0..warmup: m from start->end
-        if args.arcface_margin_start is not None and hasattr(model, "arcface_head"):
-            warm = max(int(args.arcface_warmup_epochs), 1)
-            t = min(max(epoch / warm, 0.0), 1.0)
-            m = float(args.arcface_margin_start + t * (args.arcface_margin_end - args.arcface_margin_start))
-            if hasattr(model.arcface_head, "set_margin"):
-                model.arcface_head.set_margin(m)
-            else:
-                # fallback (older ArcFace): best-effort
-                model.arcface_head.m = m
+        # ArcFace margin warm-up: AdaptiveSubCenterArcFace không hỗ trợ margin warmup trực tiếp
+        # Margin được tính từ class_counts trong __init__, không cần warmup
+        pass
 
         train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, args.device, epoch, use_amp=True)
         

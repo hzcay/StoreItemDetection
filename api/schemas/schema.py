@@ -74,6 +74,7 @@ class ProductSearchResult(BaseModel):
     product: ProductResponse
     score: float = Field(..., description="Similarity score (0.0 to 1.0)")
     similarity_percent: float = Field(..., description="Similarity as percentage (0.0 to 100.0)")
-    
+    visual_score: float = Field(..., description="Visual similarity score (0.0 to 1.0)")
+    color_score: float = Field(..., description="Color similarity score (0.0 to 1.0)")
     class Config:
         from_attributes = True
