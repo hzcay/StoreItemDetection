@@ -1,6 +1,6 @@
 export async function getCroppedImg(
     imageSrc: string,
-    pixelCrop: any
+    pixelCrop: { x: number; y: number; width: number; height: number }
 ): Promise<File> {
     const image = new Image();
     image.src = imageSrc;

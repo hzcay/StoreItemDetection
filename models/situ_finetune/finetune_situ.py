@@ -25,6 +25,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
+from models.backbone.MobileNetV3 import MobileNetV3
 from models.losses.supcon_loss import SupConLoss
 class SituDataset(Dataset):
     def __init__(self, data_dir: str, transform_visual=None, transform_color=None, is_train=True):
@@ -146,9 +147,16 @@ def compute_arcface_accuracy(embeddings, labels, arcface_head):
 
 
 def load_pretrained_checkpoint(model: nn.Module, checkpoint_path: str, device: str, strict: bool = False):
-
+    """
+    Load pretrained checkpoint with model type detection.
+    """
     print(f"📂 Loading pretrained checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # ⚠️ Auto-detect model type from checkpoint if available
+    checkpoint_model_type = checkpoint.get('model_type', None)
+    if checkpoint_model_type:
+        print(f"   📋 Checkpoint model type: {checkpoint_model_type}")
     
     state_dict = checkpoint['model_state_dict']
     model_state_dict = model.state_dict()
@@ -729,6 +737,12 @@ def main():
                         help='Use weighted sampling to balance classes (khuyến nghị cho imbalanced data)')
     parser.add_argument('--use-class-weights', action='store_true',
                         help='Use class weights in loss function (khuyến nghị cho imbalanced data)')
+    parser.add_argument('--model-type', type=str, default='resmobilenetv2',
+                        choices=['resmobilenetv2', 'mobilenetv3'],
+                        help='Model architecture (must match pretrained checkpoint)')
+    parser.add_argument('--mobilenetv3-type', type=str, default='large',
+                        choices=['large', 'small'],
+                        help='MobileNetV3 variant (default: large)')
 
     # ArcFace margin warm-up (off by default)
     parser.add_argument('--arcface-margin-start', type=float, default=None,
@@ -755,21 +769,63 @@ def main():
     print(f"   Test samples: {len(test_loader.dataset)}")
     
     print("\n🏗️  Creating model...")
-    inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
     
     # Tính class counts cho adaptive margin (nếu cần)
     class_counts = None  # Có thể tính từ dataset nếu cần
     
-    model = ResMobileNetV2(
-        inverted_residual_setting=inverted_residual_setting,
-        embedding_size=args.embedding_size,
-        num_classes=num_classes,
-        use_color_embedding=args.use_color_embedding,
-        color_embedding_size=args.color_embedding_size,
-        arcface_s=22.5,  # Giảm từ 30.0 → 22.5 để margin mềm hơn, model linh hoạt hơn
-        class_counts=class_counts,
-        dropout_rate=0.45  # Tăng từ 0.3 → 0.45 để giảm overfitting
-    ).to(args.device)
+    # Determine model type: from args, or auto-detect from checkpoint
+    model_type = getattr(args, 'model_type', None)
+    mobilenetv3_type = getattr(args, 'mobilenetv3_type', 'large')
+    
+    # ⚠️ Auto-detect from checkpoint if not specified
+    if model_type is None and args.pretrained:
+        try:
+            checkpoint = torch.load(args.pretrained, map_location='cpu')
+            checkpoint_model_type = checkpoint.get('model_type', None)
+            if checkpoint_model_type:
+                model_type = checkpoint_model_type
+                print(f"   🔍 Auto-detected model type from checkpoint: {model_type}")
+                if checkpoint_model_type == 'mobilenetv3':
+                    mobilenetv3_type = checkpoint.get('mobilenetv3_type', 'large')
+                    print(f"   🔍 Auto-detected MobileNetV3 variant: {mobilenetv3_type}")
+        except Exception as e:
+            print(f"   ⚠️  Could not auto-detect model type from checkpoint: {e}")
+    
+    # Fallback to default
+    if model_type is None:
+        model_type = 'resmobilenetv2'
+        print(f"   ⚠️  Model type not specified, defaulting to: {model_type}")
+    
+    if model_type == 'resmobilenetv2':
+        inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
+        model = ResMobileNetV2(
+            inverted_residual_setting=inverted_residual_setting,
+            embedding_size=args.embedding_size,
+            num_classes=num_classes,
+            use_color_embedding=args.use_color_embedding,
+            color_embedding_size=args.color_embedding_size,
+            arcface_s=22.5,  # Giảm từ 30.0 → 22.5 để margin mềm hơn, model linh hoạt hơn
+            class_counts=class_counts,
+            dropout_rate=0.45  # Tăng từ 0.3 → 0.45 để giảm overfitting
+        ).to(args.device)
+    elif model_type == 'mobilenetv3':
+        model = MobileNetV3(
+            embedding_size=args.embedding_size,
+            num_classes=num_classes,
+            use_color_embedding=args.use_color_embedding,
+            color_embedding_size=args.color_embedding_size,
+            arcface_s=22.5,  # Same as ResMobileNetV2
+            class_counts=class_counts,
+            model_type=mobilenetv3_type,
+            pretrained=False,  # Load from checkpoint instead
+            dropout_rate=0.45
+        ).to(args.device)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
+    
+    print(f"   Model: {model_type.upper()}")
+    if model_type == 'mobilenetv3':
+        print(f"   Variant: {mobilenetv3_type}")
 
     model.supcon_lambda = float(args.supcon_lambda)
     model.supcon_criterion = SupConLoss(temperature=args.supcon_temp) if args.supcon_lambda > 0 else None
@@ -790,28 +846,52 @@ def main():
         criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         print(f"\n   ✅ Using label smoothing ({label_smoothing}) to make model more flexible")
     
-    stem_params = list(model.conv1.parameters()) + list(model.bn1.parameters()) + \
-                  list(model.transition.parameters())
-    mobile_params = list(model.mobile_features.parameters())
-    tail_params = list(model.res_block.parameters()) + list(model.res_block_2.parameters()) + \
-                  list(model.res_block_3.parameters()) + list(model.res_block_4.parameters()) + \
-                  list(model.res_block_5.parameters()) + list(model.res_block_6.parameters())
-    head_params = list(model.fc_1.parameters()) + list(model.batch_norm_1.parameters()) + \
-                  list(model.arcface_head.parameters())
-    
-    optimizer = optim.AdamW([
-        {'params': stem_params, 'lr': args.lr * 0.1},
-        {'params': mobile_params, 'lr': args.lr * 0.1},
-        {'params': tail_params, 'lr': args.lr},
-        {'params': head_params, 'lr': args.lr * 2.0},
-    ], weight_decay=5e-4)  # Tăng weight decay để giảm overfitting
+    # Setup optimizer with different LR for different parts
+    # ⚠️ ResMobileNetV2 và MobileNetV3 có cấu trúc khác nhau
+    if model_type == 'resmobilenetv2':
+        stem_params = list(model.conv1.parameters()) + list(model.bn1.parameters()) + \
+                      list(model.transition.parameters())
+        mobile_params = list(model.mobile_features.parameters())
+        tail_params = list(model.res_block.parameters()) + list(model.res_block_2.parameters()) + \
+                      list(model.res_block_3.parameters()) + list(model.res_block_4.parameters())
+        head_params = list(model.fc_1.parameters()) + list(model.batch_norm_1.parameters()) + \
+                      list(model.arcface_head.parameters())
+        
+        optimizer = optim.AdamW([
+            {'params': stem_params, 'lr': args.lr * 0.1},
+            {'params': mobile_params, 'lr': args.lr * 0.1},
+            {'params': tail_params, 'lr': args.lr},
+            {'params': head_params, 'lr': args.lr * 2.0},
+        ], weight_decay=5e-4)
+        
+        print(f"\n📊 Learning rates (ResMobileNetV2):")
+        print(f"   Stem + MobileNet: {args.lr * 0.1:.6f}")
+        print(f"   ResNet Tail: {args.lr:.6f}")
+        print(f"   Embedding Head: {args.lr * 2.0:.6f}")
+    elif model_type == 'mobilenetv3':
+        # MobileNetV3: features backbone + embedding head
+        backbone_params = list(model.features.parameters())
+        head_params = list(model.fc_1.parameters()) + list(model.batch_norm_1.parameters()) + \
+                      list(model.arcface_head.parameters())
+        color_params = list(model.color_encoder.parameters()) if model.color_encoder else []
+        
+        optimizer = optim.AdamW([
+            {'params': backbone_params, 'lr': args.lr * 0.1},  # Backbone: LR nhỏ hơn
+            {'params': head_params, 'lr': args.lr * 2.0},      # Head: LR lớn hơn
+            {'params': color_params, 'lr': args.lr * 2.0} if color_params else [],
+        ], weight_decay=5e-4)
+        
+        print(f"\n📊 Learning rates (MobileNetV3):")
+        print(f"   Backbone (features): {args.lr * 0.1:.6f}")
+        print(f"   Embedding Head: {args.lr * 2.0:.6f}")
+        if color_params:
+            print(f"   Color Encoder: {args.lr * 2.0:.6f}")
+    else:
+        # Fallback: same LR for all
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
+        print(f"\n📊 Learning rate (uniform): {args.lr:.6f}")
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    
-    print(f"\n📊 Learning rates:")
-    print(f"   Stem + MobileNet: {args.lr * 0.1:.6f}")
-    print(f"   ResNet Tail: {args.lr:.6f}")
-    print(f"   Embedding Head: {args.lr * 2.0:.6f}")
     
     start_epoch = 0
     best_val_acc = 0.0
@@ -872,6 +952,8 @@ def main():
             'num_classes': num_classes,
             'embedding_size': args.embedding_size,
             'pretrained_from': args.pretrained,
+            'model_type': model_type,  # ⚠️ Lưu model type để detect khi load
+            'mobilenetv3_type': mobilenetv3_type if model_type == 'mobilenetv3' else None,
         }
         
         torch.save(checkpoint, os.path.join(args.output_dir, 'latest.pth'))

@@ -28,7 +28,8 @@ export const searchProductsByImage = async (
     k: number = 10,
     threshold: number = 0.5,
     visualWeight: number = 0.6,
-    colorWeight: number = 0.4
+    colorWeight: number = 0.4,
+    useYolo: boolean = true
 ): Promise<SearchResponse> => {
     const formData = new FormData();
     formData.append('image', image);
@@ -38,6 +39,7 @@ export const searchProductsByImage = async (
         threshold: threshold.toString(),
         visual_weight: visualWeight.toString(),
         color_weight: colorWeight.toString(),
+        use_yolo: useYolo.toString(),
     });
 
     try {
@@ -54,6 +56,40 @@ export const searchProductsByImage = async (
         return handleResponse<SearchResponse>(response);
     } catch (error) {
         console.error('Error searching products by image:', error);
+        throw error;
+    }
+};
+
+export const searchProductsByCroppedImage = async (
+    image: File,
+    k: number = 10,
+    threshold: number = 0.5,
+    visualWeight: number = 0.6,
+    colorWeight: number = 0.4
+): Promise<SearchResponse> => {
+    const formData = new FormData();
+    formData.append('image', image);
+
+    const params = new URLSearchParams({
+        k: k.toString(),
+        threshold: threshold.toString(),
+        visual_weight: visualWeight.toString(),
+        color_weight: colorWeight.toString(),
+    });
+
+    try {
+        const response = await fetch(`${API_BASE_URL}/products/search-by-cropped-image?${params}`, {
+            method: 'POST',
+            body: formData,
+            headers: {
+                'Accept': 'application/json',
+            },
+            credentials: 'include',
+        });
+
+        return handleResponse<SearchResponse>(response);
+    } catch (error) {
+        console.error('Error searching products by cropped image:', error);
         throw error;
     }
 };

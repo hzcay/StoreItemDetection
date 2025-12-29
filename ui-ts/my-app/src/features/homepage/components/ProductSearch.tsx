@@ -1,8 +1,10 @@
 import React, { useState, ChangeEvent, useEffect, useRef } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Search, Image as ImageIcon, X } from "lucide-react";
+import { Search, Image as ImageIcon, X, Camera } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { CameraCapture } from "./CameraCapture";
+import { ImageCropModal } from "./ImageCropModal";
 
 interface ProductSearchProps {
     onTextSearch?: (text: string) => void;
@@ -16,6 +18,9 @@ export const ProductSearch: React.FC<ProductSearchProps> = ({
     const fileInputRef = useRef<HTMLInputElement>(null);
     const [searchTerm, setSearchTerm] = useState("");
     const [imagePreview, setImagePreview] = useState<string | null>(null);
+    const [showCameraModal, setShowCameraModal] = useState(false);
+    const [showCropModal, setShowCropModal] = useState(false);
+    const [capturedImage, setCapturedImage] = useState<string | null>(null);
     const navigate = useNavigate();
 
     // 🔹 Debounce text search
@@ -31,8 +36,9 @@ export const ProductSearch: React.FC<ProductSearchProps> = ({
     useEffect(() => {
         return () => {
             if (imagePreview) URL.revokeObjectURL(imagePreview);
+            if (capturedImage) URL.revokeObjectURL(capturedImage);
         };
-    }, [imagePreview]);
+    }, [imagePreview, capturedImage]);
 
     const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
         if (!e.target.files?.[0]) return;
@@ -62,6 +68,25 @@ export const ProductSearch: React.FC<ProductSearchProps> = ({
     const clearImage = () => {
         setImagePreview(null);
         sessionStorage.removeItem('uploadedImage');
+    };
+
+    const handleCameraCapture = (imageFile: File) => {
+        const imageUrl = URL.createObjectURL(imageFile);
+        setCapturedImage(imageUrl);
+        setImagePreview(imageUrl);
+        // Tự động mở crop modal sau khi chụp ảnh
+        setShowCropModal(true);
+    };
+
+    const handleCropComplete = (croppedImage: File) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const base64String = reader.result as string;
+            sessionStorage.setItem('uploadedImage', base64String);
+            setShowCropModal(false);
+            navigate('/products-image-search');
+        };
+        reader.readAsDataURL(croppedImage);
     };
 
     return (
@@ -104,14 +129,44 @@ export const ProductSearch: React.FC<ProductSearchProps> = ({
                 id="image-upload"
                 ref={fileInputRef}
             />
-            <Button
-                variant="ghost"
-                size="icon"
-                className="absolute right-2 top-1/2 -translate-y-1/2"
-                onClick={() => fileInputRef.current?.click()}
-            >
-                <ImageIcon className="h-5 w-5" />
-            </Button>
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex gap-1">
+                <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setShowCameraModal(true)}
+                    title="Chụp ảnh"
+                >
+                    <Camera className="h-5 w-5" />
+                </Button>
+                <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Tải ảnh lên"
+                >
+                    <ImageIcon className="h-5 w-5" />
+                </Button>
+            </div>
+
+            {/* Camera Modal */}
+            <CameraCapture
+                isOpen={showCameraModal}
+                onClose={() => setShowCameraModal(false)}
+                onCapture={handleCameraCapture}
+            />
+
+            {/* Crop Modal */}
+            {capturedImage && (
+                <ImageCropModal
+                    imageSrc={capturedImage}
+                    isOpen={showCropModal}
+                    onClose={() => {
+                        setShowCropModal(false);
+                        setCapturedImage(null);
+                    }}
+                    onCropComplete={handleCropComplete}
+                />
+            )}
         </div>
     );
 };

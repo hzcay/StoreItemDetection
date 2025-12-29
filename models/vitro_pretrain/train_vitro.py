@@ -27,6 +27,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.backbone.ResMobileNetV2 import ResMobileNetV2, res_mobilenet_conf
+from models.backbone.MobileNetV3 import MobileNetV3
 from models.losses.supcon_loss import SupConLoss
 class VitroDataset(Dataset):
     def __init__(self, data_dir: str, transform_visual=None, transform_color=None, is_train=True):
@@ -632,6 +633,14 @@ def main():
                         help='Resume from checkpoint')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu',
                         help='Device to use')
+    parser.add_argument('--model-type', type=str, default='resmobilenetv2',
+                        choices=['resmobilenetv2', 'mobilenetv3'],
+                        help='Model architecture to use (default: resmobilenetv2)')
+    parser.add_argument('--mobilenetv3-type', type=str, default='large',
+                        choices=['large', 'small'],
+                        help='MobileNetV3 variant (default: large)')
+    parser.add_argument('--pretrained', action='store_true',
+                        help='Use ImageNet pretrained weights (⚠️ Set same for both models in benchmark)')
 
     parser.add_argument('--arcface-margin-start', type=float, default=None,
                         help='ArcFace margin warmup start (e.g., 0.0). If set, enables warm-up.')
@@ -662,20 +671,39 @@ def main():
     print(f"   Test samples: {len(test_loader.dataset)}")
     
     print("\n🏗️  Creating model...")
-    inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
     
     # Tính class counts cho adaptive margin (nếu cần)
     class_counts = None  # Có thể tính từ dataset nếu cần
     
-    model = ResMobileNetV2(
-        inverted_residual_setting=inverted_residual_setting,
-        embedding_size=args.embedding_size,
-        num_classes=num_classes,
-        use_color_embedding=args.use_color_embedding,
-        color_embedding_size=args.color_embedding_size,
-        arcface_s=float(args.arcface_scale),
-        class_counts=class_counts
-    ).to(args.device)
+    if args.model_type == 'resmobilenetv2':
+        inverted_residual_setting, last_channel = res_mobilenet_conf(width_mult=1.0)
+        model = ResMobileNetV2(
+            inverted_residual_setting=inverted_residual_setting,
+            embedding_size=args.embedding_size,
+            num_classes=num_classes,
+            use_color_embedding=args.use_color_embedding,
+            color_embedding_size=args.color_embedding_size,
+            arcface_s=float(args.arcface_scale),
+            class_counts=class_counts
+        ).to(args.device)
+    elif args.model_type == 'mobilenetv3':
+        model = MobileNetV3(
+            embedding_size=args.embedding_size,
+            num_classes=num_classes,
+            use_color_embedding=args.use_color_embedding,
+            color_embedding_size=args.color_embedding_size,
+            arcface_s=float(args.arcface_scale),
+            class_counts=class_counts,
+            model_type=args.mobilenetv3_type,
+            pretrained=args.pretrained  # ⚠️ Same as ResMobileNetV2 for fair comparison
+        ).to(args.device)
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+    
+    print(f"   Model: {args.model_type.upper()}")
+    if args.model_type == 'mobilenetv3':
+        print(f"   Variant: {args.mobilenetv3_type}")
+        print(f"   Pretrained: {args.pretrained}")
 
     # Attach SupCon config to model
     model.supcon_lambda = float(args.supcon_lambda)
@@ -685,8 +713,11 @@ def main():
     model.ce_warmup_epochs = int(args.ce_warmup_epochs)
     model.ce_head = nn.Linear(args.embedding_size, num_classes).to(args.device) if args.ce_warmup_epochs > 0 else None
     
-    if args.freeze_stem or args.freeze_mobile:
+    # Freeze layers (only for ResMobileNetV2)
+    if (args.freeze_stem or args.freeze_mobile) and args.model_type == 'resmobilenetv2':
         freeze_layers(model, freeze_stem=args.freeze_stem, freeze_mobile=args.freeze_mobile)
+    elif (args.freeze_stem or args.freeze_mobile) and args.model_type == 'mobilenetv3':
+        print("⚠️  Freeze layers not supported for MobileNetV3, skipping...")
     
     # ✨ Tối ưu: Compile model nếu PyTorch >= 2.0 (tăng tốc ~20-30%)
     if hasattr(torch, 'compile') and args.device == 'cuda':
@@ -764,6 +795,8 @@ def main():
             'best_val_acc': best_val_acc,
             'num_classes': num_classes,
             'embedding_size': args.embedding_size,
+            'model_type': args.model_type,  # ⚠️ Lưu model type để detect khi load
+            'mobilenetv3_type': getattr(args, 'mobilenetv3_type', None),  # Lưu variant nếu là MobileNetV3
         }
         
         torch.save(checkpoint, os.path.join(args.output_dir, 'latest.pth'))

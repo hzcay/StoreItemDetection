@@ -20,7 +20,7 @@ from api.qdrant_utils.qdrant_client import (
     get_qdrant_client,
 )
 from api.database import get_db
-from api.schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult
+from api.schemas.schema import ProductCreate, ProductResponse, ProductUpdate, ProductSearchResult, ProductSearchResponse
 from api.services.product_service import ProductService
 from api.services.minio_client import minio_client, MINIO_BUCKET
 
@@ -231,32 +231,28 @@ def list_products(
 
 @router.post(
     "/search-by-image",
-    response_model=List[ProductSearchResult],
-    summary="Search products by image"
+    response_model=ProductSearchResponse,
+    summary="Search products by image (with YOLO auto-detection or manual crop)"
 )
 async def search_product_by_image(
     image: UploadFile = File(..., description="Query image file"),
-    k: int = Query(20, ge=1, le=100, description="Number of results to return (top-K)"),
-    threshold: float = Query(0.0, ge=0.0, le=1.0, description="Minimum similarity score threshold"),
+    k: int = Query(10, ge=1, le=100, description="Number of results to return (top-K)"),
+    threshold: float = Query(0.5, ge=0.0, le=1.0, description="Minimum similarity score threshold"),
     visual_weight: float = Query(0.6, ge=0.0, le=1.0, description="Weight for visual similarity (default: 0.8)"),
     color_weight: float = Query(0.4, ge=0.0, le=1.0, description="Weight for color similarity (default: 0.2)"),
+    use_yolo: bool = Query(True, description="Use YOLO for auto-detection, if False will search entire image"),
     db: Session = Depends(get_db)
 ):
-    # Load YOLO model (cached) - ưu tiên custom model đã train
-    yolo_model = get_yolo_model()
-
     # Read image bytes
     image_bytes = await image.read()
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
-        return []
-
-    # Run detection với confidence threshold và NMS tốt hơn
-    # conf=0.25: chỉ lấy detections có confidence >= 25%
-    # iou=0.45: IoU threshold cho NMS (Non-Maximum Suppression)
-    results = yolo_model(img, conf=0.25, iou=0.45, verbose=False)
-    detections = results[0]
+        return ProductSearchResponse(
+            results=[],
+            suggested_products=[],
+            has_exact_match=False
+        )
 
     # -------- Embedding infra --------
     model = get_model()
@@ -266,39 +262,120 @@ async def search_product_by_image(
 
     service = ProductService(db)
     seen_product_ids = set()
-    all_results = []
+    exact_results = []  # Results >= threshold (best match per detection)
+    all_suggested = []  # All top-K results >= threshold (for suggestions)
 
-    # Process each detected object
-    for i, box in enumerate(detections.boxes):
-        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-        crop = img[y1:y2, x1:x2]
-        if crop.size == 0:
-            continue
+    # Mode 1: Use YOLO for auto-detection
+    if use_yolo:
+        # Load YOLO model (cached) - ưu tiên custom model đã train
+        yolo_model = get_yolo_model()
+        
+        # Run detection với confidence threshold và NMS tốt hơn
+        # conf=0.25: chỉ lấy detections có confidence >= 25%
+        # iou=0.45: IoU threshold cho NMS (Non-Maximum Suppression)
+        results = yolo_model(img, conf=0.25, iou=0.45, verbose=False)
+        detections = results[0]
 
-        # Convert crop to bytes (JPEG format)
+        # Process each detected object
+        for i, box in enumerate(detections.boxes):
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+
+            # Convert crop to bytes (JPEG format)
+            try:
+                _, crop_encoded = cv2.imencode('.jpg', crop)
+                crop_bytes = crop_encoded.tobytes()
+            except Exception as e:
+                print(f"Error encoding crop {i}: {e}")
+                continue
+
+            # Search similar products for this crop in Qdrant
+            try:
+                hits = search_similar(
+                    model=model,
+                    client=client,
+                    image_bytes=crop_bytes,
+                    top_k=k,
+                    visual_weight=visual_weight,
+                    color_weight=color_weight
+                )
+                
+                # Separate exact matches (>= threshold) and all suggestions
+                filtered_hits = [hit for hit in hits if hit.get("score", 0.0) >= threshold]
+                
+                # Process exact matches
+                if filtered_hits:
+                    best_hit = filtered_hits[0]
+                    product_id = best_hit.get("payload", {}).get("product_id")
+                    best_score = best_hit.get("score", 0.0)
+                    visual_score = best_hit.get("visual_score", 0.0)
+                    color_score = best_hit.get("color_score", 0.0)
+                    
+                    if product_id and product_id not in seen_product_ids:
+                        try:
+                            product = service.get_product(product_id)
+                            seen_product_ids.add(product_id)
+                            exact_results.append(ProductSearchResult(
+                                product=product,
+                                score=best_score,
+                                similarity_percent=best_score * 100.0,
+                                bbox={"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
+                                visual_score=visual_score,
+                                color_score=color_score
+                            ))
+                        except HTTPException:
+                            pass
+                
+                # Process all suggestions (top-K, but also >= threshold)
+                for hit in hits[:k]:  # Take top K
+                    product_id = hit.get("payload", {}).get("product_id")
+                    score = hit.get("score", 0.0)
+                    visual_score = hit.get("visual_score", 0.0)
+                    color_score = hit.get("color_score", 0.0)
+                    
+                    # Only include suggestions that are >= threshold
+                    if score >= threshold and product_id and product_id not in seen_product_ids:
+                        try:
+                            product = service.get_product(product_id)
+                            seen_product_ids.add(product_id)
+                            all_suggested.append(ProductSearchResult(
+                                product=product,
+                                score=score,
+                                similarity_percent=score * 100.0,
+                                bbox={"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
+                                visual_score=visual_score,
+                                color_score=color_score
+                            ))
+                        except HTTPException:
+                            pass
+            
+            except Exception as e:
+                print(f"Error processing crop {i}: {str(e)}")
+                continue
+    
+    # Mode 2: Search entire image (no YOLO, user will crop manually)
+    else:
+        # Use entire image for search
         try:
-            _, crop_encoded = cv2.imencode('.jpg', crop)
-            crop_bytes = crop_encoded.tobytes()
-        except Exception as e:
-            print(f"Error encoding crop {i}: {e}")
-            continue
-
-        # Search similar products for this crop in Qdrant
-        try:
+            _, img_encoded = cv2.imencode('.jpg', img)
+            img_bytes = img_encoded.tobytes()
+            
             hits = search_similar(
                 model=model,
                 client=client,
-                image_bytes=crop_bytes,
+                image_bytes=img_bytes,
                 top_k=k,
                 visual_weight=visual_weight,
                 color_weight=color_weight
             )
             
-            # Filter by threshold and get the best match
+            # Filter by threshold
             filtered_hits = [hit for hit in hits if hit.get("score", 0.0) >= threshold]
             
+            # Process exact matches
             if filtered_hits:
-                # Get the best matching product
                 best_hit = filtered_hits[0]
                 product_id = best_hit.get("payload", {}).get("product_id")
                 best_score = best_hit.get("score", 0.0)
@@ -308,29 +385,186 @@ async def search_product_by_image(
                 if product_id:
                     try:
                         product = service.get_product(product_id)
-                        
-                        # Add to results if not seen before
-                        if product_id not in seen_product_ids:
-                            seen_product_ids.add(product_id)
-                            all_results.append(ProductSearchResult(
-                                product=product,
-                                score=best_score,
-                                similarity_percent=best_score * 100.0,
-                                bbox={"x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2)},
-                                visual_score=visual_score,
-                                color_score=color_score
-                            ))
+                        exact_results.append(ProductSearchResult(
+                            product=product,
+                            score=best_score,
+                            similarity_percent=best_score * 100.0,
+                            bbox=None,  # No bbox for manual crop
+                            visual_score=visual_score,
+                            color_score=color_score
+                        ))
+                    except HTTPException:
+                        pass
+            
+            # Process suggestions
+            for hit in hits[:k]:
+                product_id = hit.get("payload", {}).get("product_id")
+                score = hit.get("score", 0.0)
+                visual_score = hit.get("visual_score", 0.0)
+                color_score = hit.get("color_score", 0.0)
+                
+                if score >= threshold and product_id and product_id not in [r.product.id for r in exact_results]:
+                    try:
+                        product = service.get_product(product_id)
+                        all_suggested.append(ProductSearchResult(
+                            product=product,
+                            score=score,
+                            similarity_percent=score * 100.0,
+                            bbox=None,
+                            visual_score=visual_score,
+                            color_score=color_score
+                        ))
                     except HTTPException:
                         pass
         
         except Exception as e:
-            print(f"Error processing crop {i}: {str(e)}")
-            continue
+            print(f"Error processing image: {str(e)}")
 
-    # Sort by score descending (highest similarity first)
-    all_results.sort(key=lambda x: x.score, reverse=True)
+    # Sort by score descending
+    exact_results.sort(key=lambda x: x.score, reverse=True)
+    all_suggested.sort(key=lambda x: x.score, reverse=True)
     
-    return all_results
+    # Remove duplicates from suggested (if already in exact_results)
+    exact_product_ids = {r.product.id for r in exact_results}
+    suggested_products = [r for r in all_suggested if r.product.id not in exact_product_ids]
+    
+    return ProductSearchResponse(
+        results=exact_results,
+        suggested_products=suggested_products[:k],  # Limit suggested to top K
+        has_exact_match=len(exact_results) > 0
+    )
+
+
+@router.post(
+    "/search-by-cropped-image",
+    response_model=ProductSearchResponse,
+    summary="Search products by manually cropped image"
+)
+async def search_product_by_cropped_image(
+    image: UploadFile = File(..., description="Cropped image file"),
+    k: int = Query(10, ge=1, le=100, description="Number of results to return (top-K)"),
+    threshold: float = Query(0.5, ge=0.0, le=1.0, description="Minimum similarity score threshold"),
+    visual_weight: float = Query(0.6, ge=0.0, le=1.0, description="Weight for visual similarity"),
+    color_weight: float = Query(0.4, ge=0.0, le=1.0, description="Weight for color similarity"),
+    db: Session = Depends(get_db)
+):
+    """
+    Search products using manually cropped image.
+    This endpoint bypasses YOLO detection and searches directly with the provided cropped image.
+    """
+    # Read image bytes
+    image_bytes = await image.read()
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return ProductSearchResponse(
+            results=[],
+            suggested_products=[],
+            has_exact_match=False
+        )
+
+    # -------- Embedding infra --------
+    model = get_model()
+    client = get_qdrant_client()
+    if model is None or client is None:
+        raise HTTPException(500, "Embedding model or Qdrant not initialized")
+
+    service = ProductService(db)
+    exact_results = []
+    all_suggested = []
+
+    # Convert image to bytes
+    try:
+        _, img_encoded = cv2.imencode('.jpg', img)
+        img_bytes = img_encoded.tobytes()
+    except Exception as e:
+        print(f"Error encoding image: {e}")
+        return ProductSearchResponse(
+            results=[],
+            suggested_products=[],
+            has_exact_match=False
+        )
+
+    # Search similar products
+    try:
+        hits = search_similar(
+            model=model,
+            client=client,
+            image_bytes=img_bytes,
+            top_k=k,
+            visual_weight=visual_weight,
+            color_weight=color_weight
+        )
+        
+        # Filter by threshold
+        filtered_hits = [hit for hit in hits if hit.get("score", 0.0) >= threshold]
+        
+        # Process exact matches
+        if filtered_hits:
+            best_hit = filtered_hits[0]
+            product_id = best_hit.get("payload", {}).get("product_id")
+            best_score = best_hit.get("score", 0.0)
+            visual_score = best_hit.get("visual_score", 0.0)
+            color_score = best_hit.get("color_score", 0.0)
+            
+            if product_id:
+                try:
+                    product = service.get_product(product_id)
+                    exact_results.append(ProductSearchResult(
+                        product=product,
+                        score=best_score,
+                        similarity_percent=best_score * 100.0,
+                        bbox=None,  # No bbox for manual crop
+                        visual_score=visual_score,
+                        color_score=color_score
+                    ))
+                except HTTPException:
+                    pass
+        
+        # Process suggestions
+        seen_product_ids = {r.product.id for r in exact_results}
+        for hit in hits[:k]:
+            product_id = hit.get("payload", {}).get("product_id")
+            score = hit.get("score", 0.0)
+            visual_score = hit.get("visual_score", 0.0)
+            color_score = hit.get("color_score", 0.0)
+            
+            if score >= threshold and product_id and product_id not in seen_product_ids:
+                try:
+                    product = service.get_product(product_id)
+                    seen_product_ids.add(product_id)
+                    all_suggested.append(ProductSearchResult(
+                        product=product,
+                        score=score,
+                        similarity_percent=score * 100.0,
+                        bbox=None,
+                        visual_score=visual_score,
+                        color_score=color_score
+                    ))
+                except HTTPException:
+                    pass
+    
+    except Exception as e:
+        print(f"Error searching cropped image: {str(e)}")
+        return ProductSearchResponse(
+            results=[],
+            suggested_products=[],
+            has_exact_match=False
+        )
+
+    # Sort by score descending
+    exact_results.sort(key=lambda x: x.score, reverse=True)
+    all_suggested.sort(key=lambda x: x.score, reverse=True)
+    
+    # Remove duplicates
+    exact_product_ids = {r.product.id for r in exact_results}
+    suggested_products = [r for r in all_suggested if r.product.id not in exact_product_ids]
+    
+    return ProductSearchResponse(
+        results=exact_results,
+        suggested_products=suggested_products[:k],
+        has_exact_match=len(exact_results) > 0
+    )
 
 
 # ------------------------------

@@ -3,52 +3,93 @@ import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { SearchResult, SearchResponse } from "@/features/product/types/product.search.type";
-import { searchProductsByImage } from "@/features/product/services/product.image.api";
+import { searchProductsByImage, searchProductsByCroppedImage } from "@/features/product/services/product.image.api";
+import { ImageCropModal } from "@/features/homepage/components/ImageCropModal";
+import { CameraCapture } from "@/features/homepage/components/CameraCapture";
 import { useEffect, useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowRight, Search, Tag, AlertCircle, Sparkles } from "lucide-react";
+import { ArrowRight, Search, Tag, AlertCircle, Sparkles, Crop, Zap, Camera } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export function ProductImageSearch() {
     const [uploadedImage, setUploadedImage] = useState<string | null>(null);
     const [searchResponse, setSearchResponse] = useState<SearchResponse | null>(null);
     const [isLoading, setIsLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [searchMode, setSearchMode] = useState<"auto" | "manual">("auto");
+    const [showCropModal, setShowCropModal] = useState(false);
+    const [showCameraModal, setShowCameraModal] = useState(false);
+    const [capturedImage, setCapturedImage] = useState<string | null>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
     const containerRef = useRef<HTMLDivElement>(null);
     const navigate = useNavigate();
 
     useEffect(() => {
-        const searchByImage = async () => {
-            const imageData = sessionStorage.getItem('uploadedImage');
-            if (!imageData) {
-                setError('Không tìm thấy ảnh trong bộ nhớ tạm. Vui lòng thử lại.');
-                return;
-            }
-
-            try {
-                setIsLoading(true);
-                setError(null);
-                setUploadedImage(imageData);
-
-                const response = await fetch(imageData);
-                const blob = await response.blob();
-                const file = new File([blob], 'uploaded-image.jpg', { type: 'image/jpeg' });
-
-                const searchResponse = await searchProductsByImage(file);
-                setSearchResponse(searchResponse);
-
-                // Draw bounding boxes for exact matches only
-                setTimeout(() => drawBoundingBoxes(imageData, searchResponse.results), 150);
-            } catch (err) {
-                console.error('Error searching by image:', err);
-                setError('Không thể kết nối đến máy chủ phân tích hình ảnh.');
-            } finally {
-                setIsLoading(false);
-            }
-        };
-
-        searchByImage();
+        const imageData = sessionStorage.getItem('uploadedImage');
+        if (!imageData) {
+            setError('Không tìm thấy ảnh trong bộ nhớ tạm. Vui lòng thử lại.');
+            return;
+        }
+        setUploadedImage(imageData);
+        
+        // Auto search với YOLO khi component mount
+        if (searchMode === "auto") {
+            handleAutoSearch(imageData);
+        }
     }, []);
+
+    const handleAutoSearch = async (imageData: string) => {
+        try {
+            setIsLoading(true);
+            setError(null);
+
+            const response = await fetch(imageData);
+            const blob = await response.blob();
+            const file = new File([blob], 'uploaded-image.jpg', { type: 'image/jpeg' });
+
+            const searchResponse = await searchProductsByImage(file, 10, 0.5, 0.6, 0.4, true);
+            setSearchResponse(searchResponse);
+
+            // Draw bounding boxes for exact matches only
+            setTimeout(() => drawBoundingBoxes(imageData, searchResponse.results), 150);
+        } catch (err) {
+            console.error('Error searching by image:', err);
+            setError('Không thể kết nối đến máy chủ phân tích hình ảnh.');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleManualCrop = async (croppedImage: File) => {
+        try {
+            setIsLoading(true);
+            setError(null);
+
+            const searchResponse = await searchProductsByCroppedImage(croppedImage);
+            setSearchResponse(searchResponse);
+            setShowCropModal(false);
+        } catch (err) {
+            console.error('Error searching by cropped image:', err);
+            setError('Không thể kết nối đến máy chủ phân tích hình ảnh.');
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    const handleCameraCapture = (imageFile: File) => {
+        const imageUrl = URL.createObjectURL(imageFile);
+        setCapturedImage(imageUrl);
+        setUploadedImage(imageUrl);
+        // Tự động mở crop modal sau khi chụp ảnh
+        setShowCropModal(true);
+    };
+
+    // Cleanup captured image URL
+    useEffect(() => {
+        return () => {
+            if (capturedImage) URL.revokeObjectURL(capturedImage);
+        };
+    }, [capturedImage]);
 
     const drawBoundingBoxes = (imageSrc: string, results: SearchResult[]) => {
         const canvas = canvasRef.current;
@@ -144,8 +185,81 @@ export function ProductImageSearch() {
                         </p>
                     )}
                 </div>
-                <Button size="sm" variant="ghost" onClick={() => navigate(-1)}>Tải ảnh khác</Button>
+                <div className="flex gap-2">
+                    <Button 
+                        size="sm" 
+                        variant="outline" 
+                        onClick={() => setShowCameraModal(true)}
+                        className="flex items-center gap-2"
+                    >
+                        <Camera className="w-4 h-4" />
+                        Chụp ảnh
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => navigate(-1)}>Tải ảnh khác</Button>
+                </div>
             </header>
+
+            {/* Mode Selection Tabs */}
+            <div className="mb-6">
+                <Tabs value={searchMode} onValueChange={(value) => setSearchMode(value as "auto" | "manual")}>
+                    <TabsList className="grid w-full max-w-md grid-cols-2">
+                        <TabsTrigger value="auto" className="flex items-center gap-2">
+                            <Zap className="w-4 h-4" />
+                            Tự động (YOLO)
+                        </TabsTrigger>
+                        <TabsTrigger value="manual" className="flex items-center gap-2">
+                            <Crop className="w-4 h-4" />
+                            Tự cắt ảnh
+                        </TabsTrigger>
+                    </TabsList>
+                    <TabsContent value="auto" className="mt-4">
+                        <div className="flex items-center gap-4">
+                            <p className="text-sm text-muted-foreground">
+                                AI sẽ tự động phát hiện sản phẩm trong ảnh
+                            </p>
+                            <Button 
+                                size="sm" 
+                                onClick={() => uploadedImage && handleAutoSearch(uploadedImage)}
+                                disabled={isLoading || !uploadedImage}
+                            >
+                                Tìm kiếm lại
+                            </Button>
+                        </div>
+                    </TabsContent>
+                    <TabsContent value="manual" className="mt-4">
+                        <div className="flex items-center gap-4">
+                            <p className="text-sm text-muted-foreground">
+                                Bạn có thể tự cắt vùng ảnh muốn tìm kiếm
+                            </p>
+                            <Button 
+                                size="sm" 
+                                onClick={() => setShowCropModal(true)}
+                                disabled={!uploadedImage}
+                            >
+                                <Crop className="w-4 h-4 mr-2" />
+                                Cắt ảnh
+                            </Button>
+                        </div>
+                    </TabsContent>
+                </Tabs>
+            </div>
+
+            {/* Camera Modal */}
+            <CameraCapture
+                isOpen={showCameraModal}
+                onClose={() => setShowCameraModal(false)}
+                onCapture={handleCameraCapture}
+            />
+
+            {/* Crop Modal */}
+            {uploadedImage && (
+                <ImageCropModal
+                    imageSrc={uploadedImage}
+                    isOpen={showCropModal}
+                    onClose={() => setShowCropModal(false)}
+                    onCropComplete={handleManualCrop}
+                />
+            )}
 
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
 

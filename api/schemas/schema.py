@@ -87,3 +87,12 @@ class ProductSearchResult(BaseModel):
     color_score: float = Field(..., description="Color similarity score (0.0 to 1.0)")
     class Config:
         from_attributes = True
+
+
+# Search response with results and suggested products
+class ProductSearchResponse(BaseModel):
+    results: List[ProductSearchResult] = Field(default_factory=list, description="Exact matches (score >= threshold)")
+    suggested_products: List[ProductSearchResult] = Field(default_factory=list, description="Suggested products (top-K, may include < threshold)")
+    has_exact_match: bool = Field(..., description="Whether there are any exact matches")
+    class Config:
+        from_attributes = True
